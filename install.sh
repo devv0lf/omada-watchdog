@@ -2,7 +2,7 @@
 # ==============================================================================
 # Omada ER605 Watchdog LXC Installer for Proxmox VE
 # Style: Proxmox Community Helper-Scripts
-# Z weryfikacją API i automatycznym wykrywaniem ER605 przed utworzeniem kontenera
+# Bezpieczne wklejanie danych, walidacja API i natywne pct push
 # ==============================================================================
 set -euo pipefail
 
@@ -36,21 +36,36 @@ cat << "EOF"
 EOF
 echo -e "${NC}${GREEN}Autoinstalator LXC dla Omada ER605 Watchdog (PVE 7 / 8 / 9)${NC}\n"
 
+# Funkcja dla pól standardowych z czyszczeniem białych znaków
 prompt() {
     local var_name="$1"
     local prompt_text="$2"
-    local default_val="$3"
+    local default_val="${3:-}"
     local input=""
 
-    echo -ne "${BOLD}${prompt_text}${NC} [${YELLOW}${default_val}${NC}]: "
-    read -r input </dev/tty || true
-    if [ -z "$input" ]; then
-        printf -v "$var_name" "%s" "$default_val"
-    else
-        printf -v "$var_name" "%s" "$input"
-    fi
+    while true; do
+        if [ -n "$default_val" ]; then
+            echo -ne "${BOLD}${prompt_text}${NC} [${YELLOW}${default_val}${NC}]: "
+        else
+            echo -ne "${BOLD}${prompt_text}${NC}: "
+        fi
+
+        read -r input </dev/tty || true
+        # Usunięcie spacji i znaków nowej linii z początku i końca
+        input=$(echo "$input" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+        if [ -z "$input" ] && [ -n "$default_val" ]; then
+            printf -v "$var_name" "%s" "$default_val"
+            break
+        elif [ -n "$input" ]; then
+            printf -v "$var_name" "%s" "$input"
+            break
+        fi
+        echo -e "${RED}To pole nie może być puste!${NC}"
+    done
 }
 
+# Funkcja dla sekretów z czyszczeniem spacji (widoczna w konsoli, aby uniknąć pomyłek)
 prompt_secret() {
     local var_name="$1"
     local prompt_text="$2"
@@ -58,13 +73,13 @@ prompt_secret() {
 
     while true; do
         echo -ne "${BOLD}${prompt_text}${NC}: "
-        read -r -s input </dev/tty || true
-        echo ""
+        read -r input </dev/tty || true
+        input=$(echo "$input" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
         if [ -n "$input" ]; then
             printf -v "$var_name" "%s" "$input"
             break
         fi
-        echo -e "${RED}To pole nie może być puste!${NC}"
+        echo -e "${RED}Pole nie może być puste! Wklej ponownie.${NC}"
     done
 }
 
@@ -87,16 +102,16 @@ prompt TARGET_STORAGE "Storage dla rootfs" "$STORAGE"
 
 echo -e "\n${BLUE}--- [2/4] Konfiguracja Omada Open API ---${NC}"
 
-# Pętla wprowadzania i walidacji poświadczeń
+# Pętla walidacji połączenia z kontrolerem
 while true; do
     prompt OMADA_URL "Adres URL kontrolera" "https://192.168.0.4"
-    prompt_secret CLIENT_ID "Omada Client ID"
+    prompt CLIENT_ID "Omada Client ID" ""
     prompt_secret CLIENT_SECRET "Omada Client Secret"
 
     while true; do
         echo -ne "${BOLD}Adres MAC routera ER605 (np. AA-BB-CC-DD-EE-FF)${NC}: "
         read -r RAW_MAC </dev/tty || true
-        CLEAN_MAC=$(echo "$RAW_MAC" | tr '[:lower:]' '[:upper:]' | tr ':' '-')
+        CLEAN_MAC=$(echo "$RAW_MAC" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]' | tr ':' '-')
         if [[ "$CLEAN_MAC" =~ ^([0-9A-F]{2}-){5}[0-9A-F]{2}$ ]]; then
             ER605_MAC="$CLEAN_MAC"
             break
@@ -106,7 +121,7 @@ while true; do
 
     echo -e "\n${YELLOW}>> Sprawdzanie połączenia z kontrolerem i weryfikacja routera...${NC}"
 
-    # Bezpieczna walidacja przez Pythona (sys.argv, brak podatności na znaki specjalne)
+    # Bezpieczna walidacja w Pythonie na hoście PVE
     VALIDATION_RESULT=$(python3 - "$OMADA_URL" "$CLIENT_ID" "$CLIENT_SECRET" "$ER605_MAC" << 'PYCHECK' 2>&1 || true
 import sys, json, urllib.request, ssl
 
@@ -117,7 +132,7 @@ target_mac = sys.argv[4].upper().replace(':', '-')
 
 ctx = ssl._create_unverified_context()
 
-# 1. Test /api/info
+# 1. Sprawdzenie /api/info
 try:
     req = urllib.request.Request(f"{url}/api/info")
     with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
@@ -125,13 +140,13 @@ try:
     omadac_id = info.get("result", {}).get("omadacId")
     ctrl_name = info.get("result", {}).get("controllerName", "Omada")
     if not omadac_id:
-        print(f"ERR:Kontroler odpowiedział, ale brak pola omadacId. Upewnij się, że adres wskazuje na kontroler.")
+        print(f"ERR:Kontroler odpowiedział, ale brak pola omadacId pod adresem {url}")
         sys.exit(0)
 except Exception as e:
     print(f"ERR:Nie można połączyć się z kontrolerem pod {url}: {e}")
     sys.exit(0)
 
-# 2. Test autoryzacji OAuth
+# 2. Sprawdzenie autoryzacji OAuth
 try:
     auth_data = json.dumps({"omadacId": omadac_id, "client_id": client_id, "client_secret": client_secret}).encode()
     req = urllib.request.Request(f"{url}/openapi/authorize/token?grant_type=client_credentials", data=auth_data, headers={"Content-Type": "application/json"})
@@ -143,10 +158,10 @@ try:
         print(f"ERR:Błąd logowania do Open API ({msg}). Sprawdź Client ID i Secret.")
         sys.exit(0)
 except Exception as e:
-    print(f"ERR:Wyjątek podczas autoryzacji tokena: {e}")
+    print(f"ERR:Błąd podczas zapytania o token OAuth: {e}")
     sys.exit(0)
 
-# 3. Pobranie listy Site'ów i urządzeń
+# 3. Weryfikacja obecności routera
 try:
     req = urllib.request.Request(f"{url}/openapi/v1/{omadac_id}/sites?pageSize=20", headers={"Authorization": f"AccessToken={token}"})
     with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
@@ -190,8 +205,8 @@ PYCHECK
         IFS='|' read -r C_NAME D_NAME D_MODEL D_SITE <<< "$DETAILS"
         echo -e "${GREEN}${BOLD}✓ Połączenie z API powiodło się!${NC}"
         echo -e "  Kontroler: ${CYAN}${C_NAME}${NC}"
-        echo -e "  Znaleziony router: ${GREEN}${BOLD}${D_NAME} (${D_MODEL})${NC} w witrynie [${D_SITE}]"
-        echo -e "  Zweryfikowany MAC: ${CYAN}${ER605_MAC}${NC}\n"
+        echo -e "  Router:    ${GREEN}${BOLD}${D_NAME} (${D_MODEL})${NC} w witrynie [${D_SITE}]"
+        echo -e "  MAC:       ${CYAN}${ER605_MAC}${NC}\n"
         break
     elif [[ "$VALIDATION_RESULT" =~ ^WARN: ]]; then
         echo -e "${YELLOW}${BOLD}! Uwaga:${NC} ${VALIDATION_RESULT#WARN:}\n"
@@ -214,7 +229,7 @@ done
 
 prompt COOLDOWN "Czas cooldownu po restarcie (w godzinach)" "3"
 
-echo -e "\n${BLUE}--- [3/4] Przygotowanie i tworzenie kontenera ---${NC}"
+echo -e "\n${BLUE}--- [3/4] Pobieranie szablonu i tworzenie kontenera ---${NC}"
 
 echo -e "${YELLOW}>> Aktualizacja listy szablonów PVE...${NC}"
 pveam update >/dev/null 2>&1 || true
@@ -240,7 +255,7 @@ pct create "$CTID" "local:vztmpl/$TEMPLATE" \
     --onboot 1 \
     --start 1
 
-echo -e "${YELLOW}>> Oczekiwanie na sieć w kontenerze...${NC}"
+echo -e "${YELLOW}>> Oczekiwanie na inicjalizację sieci w kontenerze...${NC}"
 for i in {1..20}; do
     if pct exec "$CTID" -- ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1; then
         break
