@@ -1,526 +1,699 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Omada ER605 Watchdog LXC Installer for Proxmox VE
-# Style: Proxmox Community Helper-Scripts
+# Omada ER605 Watchdog - Autoinstalator LXC dla Proxmox VE (7 / 8 / 9)
+# Uruchomienie: bash -c "$(curl -fsSL https://raw.githubusercontent.com/TWOJ_USER/omada-watchdog/main/install.sh)"
 # ==============================================================================
 set -euo pipefail
+
+# Przywrócenie ustawień terminala
 stty sane 2>/dev/null || true
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
-
-if ! command -v pveversion >/dev/null 2>&1; then
-    echo -e "${RED}Błąd: Uruchom ten skrypt bezpośrednio w powłoce Proxmox VE (PVE Shell)!${NC}"
-    exit 1
-fi
-
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}Błąd: Skrypt wymaga uprawnień roota.${NC}"
+# Sprawdzenie środowiska Proxmox
+if [ ! -f /etc/pve/pve-root-ca.pem ]; then
+    echo "[-] Błąd: Ten skrypt należy uruchomić bezpośrednio na hoście Proxmox VE." >&2
     exit 1
 fi
 
 clear
-echo -e "${CYAN}${BOLD}"
 cat << "EOF"
-   ___                     _         __      __     _       _         _             
+  ___                     _         __      __     _       _         _             
   / _ \ _ __ ___   __ _  __| | __ _  \ \    / /__ _| |_ ___| |__   __| | ___   __ _ 
  | | | | '_ ` _ \ / _` |/ _` |/ _` |  \ \/\/ / _` | __/ __| '_ \ / _` |/ _ \ / _` |
  | |_| | | | | | | (_| | (_| | (_| |   \  /\  (_| | || (__| | | | (_| | (_) | (_| |
   \___/|_| |_| |_|\__,_|\__,_|\__,_|    \/  \__,_|\__\___|_| |_|\__,_|\___/ \__, |
                                                                              |___/  
+Autoinstalator LXC dla Omada ER605 Watchdog [Cyberpunk / Matrix Edition]
 EOF
-echo -e "${NC}${GREEN}Autoinstalator LXC dla Omada ER605 Watchdog (PVE 7 / 8 / 9)${NC}\n"
 
-prompt_val() {
+prompt() {
     local var_name="$1"
-    local prompt_text="$2"
+    local question="$2"
     local default_val="${3:-}"
-    local current_val="${!var_name:-}"
-
-    if [ -n "$current_val" ]; then
-        echo -e "${BOLD}${prompt_text}:${NC} ${GREEN}${current_val}${NC} (ze środowiska)"
-        return
-    fi
-
     local input=""
+
     while true; do
         if [ -n "$default_val" ]; then
-            echo -ne "${BOLD}${prompt_text}${NC} [${YELLOW}${default_val}${NC}]: "
+            read -r -e -p "$question [$default_val]: " input </dev/tty || true
+            input="${input:-$default_val}"
         else
-            echo -ne "${BOLD}${prompt_text}${NC}: "
+            read -r -e -p "$question: " input </dev/tty || true
         fi
-        read -r input || true
-        input=$(echo "$input" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-
-        if [ -z "$input" ] && [ -n "$default_val" ]; then
-            printf -v "$var_name" "%s" "$default_val"
-            break
-        elif [ -n "$input" ]; then
+        input="$(echo -n "$input" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        if [ -n "$input" ]; then
             printf -v "$var_name" "%s" "$input"
             break
         fi
-        echo -e "${RED}To pole jest wymagane!${NC}"
     done
 }
 
-echo -e "${BLUE}--- [1/4] Parametry kontenera LXC ---${NC}"
-NEXT_ID=$(pvesh get /cluster/nextid)
-CTID="${CTID:-}"
-prompt_val CTID "Numer ID nowego kontenera" "$NEXT_ID"
-HOSTNAME="${HOSTNAME:-}"
-prompt_val HOSTNAME "Nazwa hosta" "omada-watchdog"
-RAM="${RAM:-}"
-prompt_val RAM "Pamięć RAM w MB" "512"
-DISK="${DISK:-}"
-prompt_val DISK "Rozmiar dysku w GB" "2"
-WEB_PORT="${WEB_PORT:-}"
-prompt_val WEB_PORT "Port Web UI" "8080"
+echo -e "\n--- [1/4] Parametry kontenera LXC ---"
+NEXT_ID=$(pvesh get /cluster/nextid 2>/dev/null || echo "107")
+prompt CT_ID "Numer ID nowego kontenera" "$NEXT_ID"
+prompt CT_HOSTNAME "Nazwa kontenera" "omada-watchdog"
+prompt CT_RAM "Pamięć RAM w MB" "512"
+prompt CT_DISK "Rozmiar dysku w GB" "2"
+prompt WEB_PORT "Port Web UI" "8080"
 
-STORAGE="local-lvm"
-if ! pvesm status -storage "$STORAGE" &>/dev/null; then
-    STORAGE="local-zfs"
-    if ! pvesm status -storage "$STORAGE" &>/dev/null; then
-        STORAGE="local"
-    fi
+DEFAULT_STORAGE="local-lvm"
+if ! pvesm status -storage "$DEFAULT_STORAGE" &>/dev/null; then
+    DEFAULT_STORAGE=$(pvesm status -content rootdir 2>/dev/null | awk 'NR>1 {print $1; exit}')
+    DEFAULT_STORAGE="${DEFAULT_STORAGE:-local}"
 fi
-TARGET_STORAGE="${TARGET_STORAGE:-}"
-prompt_val TARGET_STORAGE "Storage dla rootfs" "$STORAGE"
+prompt CT_STORAGE "Storage dla rootfs" "$DEFAULT_STORAGE"
 
-echo -e "\n${BLUE}--- [2/4] Konfiguracja Omada Open API ---${NC}"
+echo -e "\n--- [2/4] Konfiguracja Omada Open API ---"
+prompt OMADA_URL "Adres URL kontrolera" "https://192.168.0.4"
+prompt OMADA_ID "Omada ID (z Open API Attributes)" ""
+prompt CLIENT_ID "Omada Client ID" ""
+prompt CLIENT_SECRET "Omada Client Secret" ""
+prompt TARGET_MAC "Adres MAC routera ER605" ""
+TARGET_MAC=$(echo "$TARGET_MAC" | tr '[:lower:]' '[:upper:]' | tr ':' '-')
 
-RESOLVED_SITE_ID=""
-RESOLVED_ROUTER_NAME=""
+echo ">> Weryfikacja połączenia i wyszukiwanie routera w Omada API..."
+VERIFY_OUTPUT=$(python3 - "$OMADA_URL" "$OMADA_ID" "$CLIENT_ID" "$CLIENT_SECRET" "$TARGET_MAC" << 'EOF'
+import sys, json, ssl, urllib.request
 
-while true; do
-    OMADA_URL="${OMADA_URL:-}"
-    prompt_val OMADA_URL "Adres URL kontrolera" "https://192.168.0.4"
-    OMADA_ID="${OMADA_ID:-}"
-    prompt_val OMADA_ID "Omada ID (z Open API Attributes)" ""
-    CLIENT_ID="${CLIENT_ID:-}"
-    prompt_val CLIENT_ID "Omada Client ID" ""
-    CLIENT_SECRET="${CLIENT_SECRET:-}"
-    prompt_val CLIENT_SECRET "Omada Client Secret" ""
-
-    ER605_MAC="${ER605_MAC:-}"
-    while true; do
-        if [ -n "$ER605_MAC" ]; then
-            CLEAN_MAC=$(echo "$ER605_MAC" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]' | tr ':' '-')
-            if [[ "$CLEAN_MAC" =~ ^([0-9A-F]{2}-){5}[0-9A-F]{2}$ ]]; then
-                ER605_MAC="$CLEAN_MAC"
-                echo -e "${BOLD}MAC routera ER605:${NC} ${GREEN}${ER605_MAC}${NC}"
-                break
-            fi
-        fi
-        echo -ne "${BOLD}Adres MAC routera ER605 (np. AA-BB-CC-DD-EE-FF)${NC}: "
-        read -r RAW_MAC || true
-        CLEAN_MAC=$(echo "$RAW_MAC" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]' | tr ':' '-')
-        if [[ "$CLEAN_MAC" =~ ^([0-9A-F]{2}-){5}[0-9A-F]{2}$ ]]; then
-            ER605_MAC="$CLEAN_MAC"
-            break
-        fi
-        echo -e "${RED}Nieprawidłowy format MAC.${NC}"
-    done
-
-    echo -e "\n${YELLOW}>> Weryfikacja połączenia i wyszukiwanie routera w Omada API...${NC}"
-
-    VALIDATION_RESULT=$(python3 - "$OMADA_URL" "$OMADA_ID" "$CLIENT_ID" "$CLIENT_SECRET" "$ER605_MAC" << 'PYCHECK' 2>&1 || true
-import sys, json, urllib.request, ssl
-
-url = sys.argv[1].rstrip('/')
-omadac_id = sys.argv[2]
-client_id = sys.argv[3]
-client_secret = sys.argv[4]
-target_mac = sys.argv[5].upper().replace(':', '-')
-
+url, omadac_id, client_id, client_secret, target_mac = sys.argv[1:6]
 ctx = ssl._create_unverified_context()
 
-# 1. Autoryzacja OAuth
 try:
+    token_url = f"{url.rstrip('/')}/openapi/authorize/token?grant_type=client_credentials"
     auth_data = json.dumps({"omadacId": omadac_id, "client_id": client_id, "client_secret": client_secret}).encode()
-    req = urllib.request.Request(f"{url}/openapi/authorize/token?grant_type=client_credentials", data=auth_data, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+    req = urllib.request.Request(token_url, data=auth_data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
         token_res = json.loads(r.read().decode())
-    token = token_res.get("result", {}).get("accessToken")
-    if not token:
-        msg = token_res.get("msg", "Błędne poświadczenia")
-        print(f"ERR:Błąd logowania do Open API ({msg}).")
-        sys.exit(0)
-except Exception as e:
-    print(f"ERR:Nie można połączyć się z kontrolerem {url}: {e}")
-    sys.exit(0)
+    
+    if token_res.get('errorCode') != 0:
+        print(f"ERROR: Błąd autoryzacji: {token_res.get('msg', 'Nieznany błąd')}")
+        sys.exit(1)
+        
+    token = token_res['result']['accessToken']
+    headers = {"AccessToken": token, "Content-Type": "application/json"}
 
-# 2. Pobranie witryn i urządzeń
-try:
-    req = urllib.request.Request(f"{url}/openapi/v1/{omadac_id}/sites?page=1&pageSize=20", headers={"Authorization": f"AccessToken={token}"})
-    with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+    sites_url = f"{url.rstrip('/')}/openapi/v1/{omadac_id}/sites?page=1&pageSize=100"
+    req_sites = urllib.request.Request(sites_url, headers=headers)
+    with urllib.request.urlopen(req_sites, context=ctx, timeout=10) as r:
         sites_res = json.loads(r.read().decode())
-    sites = sites_res.get("result", {}).get("data", []) or [{"siteId": "Default", "name": "Default"}]
+    
+    sites = sites_res.get('result', {}).get('data', [])
+    if not sites:
+        print("ERROR: Brak witryn przypisanych do aplikacji w kontrolerze.")
+        sys.exit(1)
 
-    found_device = None
-    all_devices = []
-
-    for site in sites:
-        s_id = site.get("siteId")
-        d_req = urllib.request.Request(f"{url}/openapi/v1/{omadac_id}/sites/{s_id}/devices?page=1&pageSize=100", headers={"Authorization": f"AccessToken={token}"})
-        with urllib.request.urlopen(d_req, context=ctx, timeout=8) as r:
+    found_site = None
+    device_info = None
+    for s in sites:
+        s_id = s.get('siteId')
+        dev_url = f"{url.rstrip('/')}/openapi/v1/{omadac_id}/sites/{s_id}/devices?page=1&pageSize=100"
+        req_dev = urllib.request.Request(dev_url, headers=headers)
+        with urllib.request.urlopen(req_dev, context=ctx, timeout=10) as r:
             dev_res = json.loads(r.read().decode())
-        devs = dev_res.get("result", {}).get("data", []) or []
-        for d in devs:
-            d_mac = d.get("mac", "").upper().replace(':', '-')
-            d_model = d.get("model", d.get("deviceCategory", "Urządzenie"))
-            d_name = d.get("name", d_model)
-            all_devices.append(f"{d_name} ({d_model}) - MAC: {d_mac}")
+        
+        for dev in dev_res.get('result', {}).get('data', []):
+            d_mac = dev.get('mac', '').replace(':', '-').upper()
             if d_mac == target_mac:
-                found_device = (d_name, d_model, site.get("name", s_id), s_id)
+                found_site = s
+                device_info = dev
                 break
-        if found_device:
+        if found_site:
             break
 
-    if found_device:
-        print(f"OK:{found_device[0]}|{found_device[1]}|{found_device[2]}|{found_device[3]}")
+    if found_site and device_info:
+        print("SUCCESS")
+        print(found_site.get('siteId'))
+        print(found_site.get('name', 'Brak'))
+        print(device_info.get('name', 'Brak'))
+        print(device_info.get('model', 'ER605'))
     else:
-        dev_list = "\\n  - ".join(all_devices) if all_devices else "Brak urządzeń w kontrolerze."
-        print(f"WARN:Nie znaleziono routera o MAC {target_mac}. Wykryte urządzenia:\\n  - {dev_list}")
+        print(f"NOT_FOUND: Nie znaleziono urządzenia o MAC {target_mac}.")
+        sys.exit(2)
+
 except Exception as e:
-    print(f"ERR:Błąd pobierania danych urządzeń: {e}")
-PYCHECK
-)
+    print(f"ERROR: Wyjątek podczas weryfikacji API: {e}")
+    sys.exit(1)
+EOF
+) || true
 
-    if [[ "$VALIDATION_RESULT" =~ ^OK: ]]; then
-        DETAILS=${VALIDATION_RESULT#OK:}
-        IFS='|' read -r D_NAME D_MODEL D_SITE D_SITE_ID <<< "$DETAILS"
-        RESOLVED_SITE_ID="$D_SITE_ID"
-        RESOLVED_ROUTER_NAME="$D_NAME ($D_MODEL)"
-        echo -e "${GREEN}${BOLD}✓ Połączenie z API powiodło się!${NC}"
-        echo -e "  Znaleziony router: ${GREEN}${BOLD}${RESOLVED_ROUTER_NAME}${NC}"
-        echo -e "  Witryna:           ${CYAN}${D_SITE}${NC} (ID: ${D_SITE_ID})"
-        echo -e "  Zweryfikowany MAC: ${CYAN}${ER605_MAC}${NC}\n"
-        break
-    elif [[ "$VALIDATION_RESULT" =~ ^WARN: ]]; then
-        echo -e "${YELLOW}${BOLD}! Uwaga:${NC} ${VALIDATION_RESULT#WARN:}\n"
-        echo -ne "${BOLD}Czy chcesz kontynuować mimo to? (t/N)${NC}: "
-        read -r CONFIRM || true
-        if [[ "$CONFIRM" =~ ^[tTyY]$ ]]; then
-            break
-        fi
-        OMADA_ID=""
-        CLIENT_ID=""
-        CLIENT_SECRET=""
-        ER605_MAC=""
-    else
-        ERR_MSG=${VALIDATION_RESULT#ERR:}
-        echo -e "${RED}${BOLD}✗ Weryfikacja nie powiodła się:${NC} ${ERR_MSG}\n"
-        echo -ne "${BOLD}Czy chcesz spróbować ponownie? (T/n)${NC}: "
-        read -r RETRY || true
-        if [[ "$RETRY" =~ ^[nN]$ ]]; then
-            echo -e "${RED}Przerwano instalację.${NC}"
-            exit 1
-        fi
-        OMADA_ID=""
-        CLIENT_ID=""
-        CLIENT_SECRET=""
+STATUS=$(echo "$VERIFY_OUTPUT" | head -n 1)
+
+if [ "$STATUS" == "SUCCESS" ]; then
+    SITE_ID=$(echo "$VERIFY_OUTPUT" | sed -n '2p')
+    SITE_NAME=$(echo "$VERIFY_OUTPUT" | sed -n '3p')
+    DEV_NAME=$(echo "$VERIFY_OUTPUT" | sed -n '4p')
+    DEV_MODEL=$(echo "$VERIFY_OUTPUT" | sed -n '5p')
+    echo "✓ Połączenie z API powiodło się!"
+    echo "  Router:  $DEV_NAME ($DEV_MODEL)"
+    echo "  Witryna: $SITE_NAME (ID: $SITE_ID)"
+else
+    echo "[-] Ostrzeżenie weryfikacji:"
+    echo "$VERIFY_OUTPUT"
+    read -r -p "Kontynuować mimo to? (t/N): " FORCE_CONT </dev/tty || true
+    if [[ ! "$FORCE_CONT" =~ ^[tTyY]$ ]]; then
+        echo "Przerwano."
+        exit 1
     fi
-done
-
-COOLDOWN="${COOLDOWN:-}"
-prompt_val COOLDOWN "Czas cooldownu po restarcie (w godzinach)" "3"
-
-echo -e "\n${BLUE}--- [3/4] Pobieranie szablonu i tworzenie kontenera ---${NC}"
-
-pveam update >/dev/null 2>&1 || true
-TEMPLATE=$(pveam available -section system | awk '{print $2}' | grep -E 'debian-12-standard' | sort -V | tail -n 1 || true)
-if [ -z "$TEMPLATE" ]; then
-    TEMPLATE=$(pveam available -section system | awk '{print $2}' | grep -E 'debian' | sort -V | tail -n 1)
+    SITE_ID=""
 fi
 
-echo -e "${YELLOW}>> Pobieranie szablonu OS (${TEMPLATE})...${NC}"
-pveam download local "$TEMPLATE" >/dev/null 2>&1 || true
+prompt COOLDOWN_HOURS "Czas cooldownu po restarcie (w godzinach)" "3"
 
-echo -e "${YELLOW}>> Tworzenie kontenera LXC ($CTID)...${NC}"
-pct create "$CTID" "local:vztmpl/$TEMPLATE" \
-    --hostname "$HOSTNAME" \
+echo -e "\n--- [3/4] Pobieranie szablonu i tworzenie kontenera ---"
+pveam update >/dev/null 2>&1 || true
+TEMPLATE=$(pveam available -section system | grep "debian-12-standard" | awk '{print $2}' | sort -V | tail -n 1)
+
+TEMPLATE_STORAGE="local"
+if ! pvesm status -storage "$TEMPLATE_STORAGE" &>/dev/null; then
+    TEMPLATE_STORAGE="$CT_STORAGE"
+fi
+
+if [ ! -f "/var/lib/vz/template/cache/$TEMPLATE" ]; then
+    echo ">> Pobieranie szablonu OS ($TEMPLATE)..."
+    pveam download "$TEMPLATE_STORAGE" "$TEMPLATE"
+fi
+
+echo ">> Tworzenie kontenera LXC ($CT_ID)..."
+pct create "$CT_ID" "$TEMPLATE_STORAGE:vztmpl/$TEMPLATE" \
+    --hostname "$CT_HOSTNAME" \
     --cores 1 \
-    --memory "$RAM" \
+    --memory "$CT_RAM" \
     --swap 256 \
-    --net0 name=eth0,bridge=vmbr0,ip=dhcp,firewall=1 \
-    --storage "$TARGET_STORAGE" \
-    --rootfs "${TARGET_STORAGE}:${DISK}" \
-    --unprivileged 1 \
+    --features nesting=1 \
+    --net0 name=eth0,bridge=vmbr0,ip=dhcp \
+    --storage "$CT_STORAGE" \
+    --rootfs "${CT_STORAGE}:${CT_DISK}" \
     --onboot 1 \
+    --unprivileged 1 \
     --start 1
 
-echo -e "${YELLOW}>> Oczekiwanie na sieć w kontenerze...${NC}"
+echo ">> Oczekiwanie na sieć w kontenerze..."
 for i in {1..20}; do
-    if pct exec "$CTID" -- ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1; then
+    CT_IP=$(pct exec "$CT_ID" -- ip -4 addr show eth0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || true)
+    if [ -n "$CT_IP" ]; then
         break
     fi
     sleep 1
 done
 
-echo -e "${YELLOW}>> Instalacja pakietów w LXC (python3, ping, curl)...${NC}"
-pct exec "$CTID" -- bash -c "apt-get update -qq && apt-get install -y -qq python3 iputils-ping curl ca-certificates" >/dev/null
-pct exec "$CTID" -- mkdir -p /opt/omada-watchdog /etc
+echo ">> Instalacja pakietów w LXC (python3, ping, curl)..."
+pct exec "$CT_ID" -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 iputils-ping curl ca-certificates" >/dev/null
 
-echo -e "\n${BLUE}--- [4/4] Bezpieczne wgrywanie konfiguracji i start serwisu ---${NC}"
-TMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TMP_DIR"' EXIT
-TMP_CONFIG="${TMP_DIR}/config.json"
-touch "$TMP_CONFIG"
-chmod 600 "$TMP_CONFIG"
+echo -e "\n--- [4/4] Konfiguracja aplikacji i start serwisu ---"
+pct exec "$CT_ID" -- mkdir -p /opt/omada-watchdog
 
-# Bezpieczny zapis parametrów do JSON
-python3 - "$TMP_CONFIG" "$OMADA_URL" "$OMADA_ID" "$CLIENT_ID" "$CLIENT_SECRET" "$ER605_MAC" "$COOLDOWN" "$WEB_PORT" "$RESOLVED_SITE_ID" << 'PYGEN'
+TMP_CONF=$(mktemp)
+python3 - "$OMADA_URL" "$OMADA_ID" "$CLIENT_ID" "$CLIENT_SECRET" "$SITE_ID" "$TARGET_MAC" "$COOLDOWN_HOURS" "$WEB_PORT" "$TMP_CONF" << 'EOF'
 import sys, json
 
-with open(sys.argv[1], "w", encoding="utf-8") as f:
-    json.dump({
-        "OMADA_URL": sys.argv[2].rstrip('/'),
-        "OMADA_ID": sys.argv[3],
-        "CLIENT_ID": sys.argv[4],
-        "CLIENT_SECRET": sys.argv[5],
-        "ER605_MAC": sys.argv[6],
-        "COOLDOWN_HOURS": int(sys.argv[7]),
-        "PORT": int(sys.argv[8]),
-        "SITE_ID": sys.argv[9]
-    }, f, indent=2, ensure_ascii=False)
-PYGEN
-
-pct push "$CTID" "$TMP_CONFIG" /etc/omada-watchdog.json --perms 0600
-
-TMP_APP="${TMP_DIR}/app.py"
-cat << 'PYEOF' > "$TMP_APP"
-#!/usr/bin/env python3
-import http.server
-import json
-import os
-import socketserver
-import subprocess
-import threading
-import time
-import urllib.request
-import ssl
-from datetime import datetime
-
-CONFIG_PATH = '/etc/omada-watchdog.json'
-try:
-    with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-        config = json.load(f)
-except Exception as e:
-    print(f'BŁĄD: Nie można wczytać {CONFIG_PATH}: {e}')
-    raise SystemExit(1)
-
-OMADA_URL = config.get('OMADA_URL', '').rstrip('/')
-OMADA_ID = config.get('OMADA_ID', '')
-CLIENT_ID = config.get('CLIENT_ID', '')
-CLIENT_SECRET = config.get('CLIENT_SECRET', '')
-ER605_MAC = config.get('ER605_MAC', '')
-COOLDOWN_HOURS = int(config.get('COOLDOWN_HOURS', 3))
-PORT = int(config.get('PORT', 8080))
-SITE_ID = config.get('SITE_ID', '')
-
-CHECK_IPS = ['1.1.1.1', '8.8.8.8', '9.9.9.9']
-
-state = {
-    'status': 'Oczekiwanie...',
-    'last_check': 'Brak',
-    'last_reboot': 'Brak',
-    'last_reboot_ts': 0,
-    'logs': []
+data = {
+    "omada_url": sys.argv[1].rstrip('/'),
+    "omadac_id": sys.argv[2],
+    "client_id": sys.argv[3],
+    "client_secret": sys.argv[4],
+    "site_id": sys.argv[5],
+    "target_mac": sys.argv[6].replace(':', '-').upper(),
+    "cooldown_hours": float(sys.argv[7]),
+    "web_port": int(sys.argv[8]),
+    "ping_hosts": ["1.1.1.1", "8.8.8.8", "9.9.9.9"],
+    "check_interval_minutes": 30,
+    "max_retries": 3,
+    "retry_delay_seconds": 15
 }
 
-def log(msg):
-    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    entry = f'[{ts}] {msg}'
-    print(entry, flush=True)
-    state['logs'].insert(0, entry)
-    if len(state['logs']) > 50:
-        state['logs'].pop()
+with open(sys.argv[9], 'w', encoding='utf-8') as f:
+    json.dump(data, f, indent=2)
+EOF
 
-def ping_target(ip):
+pct push "$CT_ID" "$TMP_CONF" /opt/omada-watchdog/config.json
+rm -f "$TMP_CONF"
+pct exec "$CT_ID" -- chmod 0600 /opt/omada-watchdog/config.json
+
+# Wgranie kodu aplikacji
+TMP_APP=$(mktemp)
+cat << 'EOF' > "$TMP_APP"
+import os, sys, json, time, subprocess, urllib.request, ssl, threading
+from datetime import datetime, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+CONFIG_FILE = "/opt/omada-watchdog/config.json"
+STATE_FILE = "/opt/omada-watchdog/state.json"
+
+with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+ctx = ssl._create_unverified_context()
+
+state = {
+    "last_check": None,
+    "last_status": "Oczekiwanie...",
+    "last_reboot": None,
+    "last_latency_ms": None,
+    "consecutive_failures": 0,
+    "history_24h": [],
+    "logs": []
+}
+
+if os.path.exists(STATE_FILE):
     try:
-        res = subprocess.run(['ping', '-c', '2', '-W', '2', ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return res.returncode == 0
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            state.update(json.load(f))
     except Exception:
-        return False
+        pass
+
+def save_state():
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+    except Exception:
+        pass
+
+def log(msg):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"[{ts}] {msg}"
+    print(entry, flush=True)
+    state["logs"].append(entry)
+    if len(state["logs"]) > 100:
+        state["logs"].pop(0)
+    save_state()
 
 def check_internet():
-    for attempt in range(1, 4):
-        for ip in CHECK_IPS:
-            if ping_target(ip):
-                return True
-        if attempt < 3:
-            time.sleep(15)
-    return False
+    for host in CONFIG.get("ping_hosts", ["1.1.1.1", "8.8.8.8", "9.9.9.9"]):
+        try:
+            t0 = time.time()
+            res = subprocess.run(["ping", "-c", "1", "-W", "2", host], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            if res.returncode == 0:
+                dt = (time.time() - t0) * 1000
+                return True, round(dt, 1)
+        except Exception:
+            pass
+    return False, None
 
-def get_omada_token(ctx):
-    auth_payload = json.dumps({'omadacId': OMADA_ID, 'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET}).encode('utf-8')
-    auth_req = urllib.request.Request(
-        f'{OMADA_URL}/openapi/authorize/token?grant_type=client_credentials',
-        data=auth_payload,
-        headers={'Content-Type': 'application/json'}
-    )
-    with urllib.request.urlopen(auth_req, context=ctx, timeout=10) as r:
-        token_data = json.loads(r.read().decode())
-    
-    token = token_data.get('result', {}).get('accessToken')
-    if not token:
-        err = token_data.get('msg', 'Brak tokena')
-        raise Exception(f'Błąd logowania Open API: {err}')
-    return token
+def get_token():
+    url = f"{CONFIG['omada_url']}/openapi/authorize/token?grant_type=client_credentials"
+    data = json.dumps({
+        "omadacId": CONFIG["omadac_id"],
+        "client_id": CONFIG["client_id"],
+        "client_secret": CONFIG["client_secret"]
+    }).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+        res = json.loads(r.read().decode())
+    if res.get("errorCode") != 0:
+        err = res.get("errorCode")
+        raise Exception(res.get("msg") or f"Błąd API tokena: {err}")
+    return res["result"]["accessToken"]
 
-def reboot_er605():
-    global SITE_ID
-    ctx = ssl._create_unverified_context()
-    token = get_omada_token(ctx)
+def reboot_router():
+    log(f"Inicjalizacja restartu routera {CONFIG['target_mac']}...")
+    token = get_token()
+    headers = {"AccessToken": token, "Content-Type": "application/json"}
+    site_id = CONFIG.get("site_id")
+    if not site_id:
+        sites_url = f"{CONFIG['omada_url']}/openapi/v1/{CONFIG['omadac_id']}/sites?page=1&pageSize=100"
+        req_sites = urllib.request.Request(sites_url, headers=headers)
+        with urllib.request.urlopen(req_sites, context=ctx, timeout=10) as r:
+            sites_res = json.loads(r.read().decode())
+        sites = sites_res.get("result", {}).get("data", [])
+        if sites:
+            site_id = sites[0].get("siteId")
 
-    if not SITE_ID:
-        site_req = urllib.request.Request(
-            f'{OMADA_URL}/openapi/v1/{OMADA_ID}/sites?page=1&pageSize=1',
-            headers={'Authorization': f'AccessToken={token}'}
-        )
-        with urllib.request.urlopen(site_req, context=ctx, timeout=10) as r:
-            site_data = json.loads(r.read().decode())
-        sites = site_data.get('result', {}).get('data', [])
-        SITE_ID = sites[0]['siteId'] if sites else 'Default'
-
-    body = json.dumps({'deviceMacs': [ER605_MAC]}).encode('utf-8')
-    reboot_req = urllib.request.Request(
-        f'{OMADA_URL}/openapi/v1/{OMADA_ID}/sites/{SITE_ID}/cmd/devices/reboot',
-        data=body,
-        headers={'Authorization': f'AccessToken={token}', 'Content-Type': 'application/json'}
-    )
-    with urllib.request.urlopen(reboot_req, context=ctx, timeout=10) as r:
+    reboot_url = f"{CONFIG['omada_url']}/openapi/v1/{CONFIG['omadac_id']}/sites/{site_id}/cmd/devices/{CONFIG['target_mac']}/reboot"
+    req_reboot = urllib.request.Request(reboot_url, data=b"{}", headers=headers)
+    with urllib.request.urlopen(req_reboot, context=ctx, timeout=10) as r:
         res = json.loads(r.read().decode())
     
-    if res.get('errorCode') != 0:
-        raise Exception(res.get('msg', f'Błąd API: {res.get(\"errorCode\")}'))
+    if res.get("errorCode") != 0:
+        err = res.get("errorCode")
+        raise Exception(res.get("msg") or f"Błąd API rebootu: {err}")
+    
+    state["last_reboot"] = datetime.now().isoformat()
+    log("Komenda restartu wysłana pomyślnie do kontrolera Omada!")
+    save_state()
 
 def run_watchdog(manual=False):
-    prefix = ' (test ręczny)' if manual else ''
-    log(f'Sprawdzanie połączenia{prefix}...')
-    online = check_internet()
-    state['last_check'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    prefix = " [MANUAL]" if manual else ""
+    log(f"Sprawdzanie łączności WAN{prefix}...")
+    online, lat = check_internet()
+    now = datetime.now()
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    state["last_check"] = now_str
+    state["last_latency_ms"] = lat
+
+    cutoff = (now - timedelta(hours=24)).isoformat()
+    state["history_24h"] = [p for p in state.get("history_24h", []) if p.get("ts", "") > cutoff]
+    state["history_24h"].append({
+        "ts": now.isoformat(),
+        "time": now.strftime("%H:%M"),
+        "status": "ONLINE" if online else "OFFLINE",
+        "ms": lat if online else 0
+    })
 
     if online:
-        state['status'] = 'ONLINE'
-        log('Łączność aktywna (ONLINE).')
-        return
+        state["last_status"] = "ONLINE"
+        state["consecutive_failures"] = 0
+        log(f"Status: ONLINE ({lat} ms){prefix}")
+    else:
+        state["last_status"] = "OFFLINE"
+        state["consecutive_failures"] += 1
+        log(f"ALERT: Brak WAN! Próba {state['consecutive_failures']}/{CONFIG.get('max_retries', 3)}")
+        
+        if state["consecutive_failures"] >= CONFIG.get("max_retries", 3):
+            in_cooldown = False
+            if state.get("last_reboot"):
+                try:
+                    lr = datetime.fromisoformat(state["last_reboot"])
+                    if datetime.now() - lr < timedelta(hours=CONFIG.get("cooldown_hours", 3)):
+                        in_cooldown = True
+                except Exception:
+                    pass
+            if in_cooldown:
+                log("Cooldown aktywny — pomijanie procedury restartu.")
+            else:
+                try:
+                    reboot_router()
+                    state["consecutive_failures"] = 0
+                except Exception as e:
+                    log(f"CRITICAL: Błąd restartu: {e}")
+    save_state()
 
-    state['status'] = 'OFFLINE'
-    log('KRYTYCZNE: Brak internetu po 3 próbach (OFFLINE)!')
-
-    now = time.time()
-    cooldown_sec = COOLDOWN_HOURS * 3600
-    elapsed = now - state['last_reboot_ts']
-
-    if elapsed < cooldown_sec and not manual:
-        rem = int((cooldown_sec - elapsed) / 60)
-        log(f'Cooldown aktywny. Restart routera wstrzymany na {rem} min.')
-        return
-
-    try:
-        log(f'Wysyłanie polecenia restartu ER605 ({ER605_MAC})...')
-        reboot_er605()
-        state['last_reboot_ts'] = now
-        state['last_reboot'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        log('SUKCES: Router ER605 został zrestartowany przez API!')
-    except Exception as e:
-        log(f'BŁĄD restartu: {e}')
-
-def scheduler_thread():
-    time.sleep(5)
+def watchdog_loop():
     while True:
-        run_watchdog(manual=False)
-        time.sleep(1800)
+        try:
+            run_watchdog(manual=False)
+        except Exception as e:
+            log(f"Pętla błędu: {e}")
+        time.sleep(CONFIG.get("check_interval_minutes", 30) * 60)
 
-HTML_PAGE = '''<!DOCTYPE html>
+class RequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/api/status":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(state).encode())
+            return
+        
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+
+        cooldown_str = "BRAK"
+        if state.get("last_reboot"):
+            try:
+                lr = datetime.fromisoformat(state["last_reboot"])
+                rem = timedelta(hours=CONFIG.get("cooldown_hours", 3)) - (datetime.now() - lr)
+                if rem.total_seconds() > 0:
+                    mins = int(rem.total_seconds() // 60)
+                    cooldown_str = f"AKTYWNY (~{mins} MIN)"
+                else:
+                    cooldown_str = "WYGASŁY"
+            except Exception:
+                pass
+
+        history_json = json.dumps(state.get("history_24h", []))
+        logs_html = "\n".join(reversed(state.get("logs", [])))
+
+        html = f"""<!DOCTYPE html>
 <html lang="pl">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Omada ER605 Watchdog</title>
-<style>
-  :root {{ --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --muted: #94a3b8; --border: #334155; }}
-  body {{ font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 24px; display: flex; justify-content: center; }}
-  .container {{ width: 100%; max-width: 680px; }}
-  .card {{ background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.4); }}
-  .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }}
-  h1 {{ font-size: 1.25rem; margin: 0; font-weight: 600; }}
-  .badge {{ padding: 5px 12px; border-radius: 999px; font-size: 0.8rem; font-weight: 700; text-transform: uppercase; }}
-  .badge.ONLINE {{ background: #14532d; color: #86efac; border: 1px solid #22c55e; }}
-  .badge.OFFLINE {{ background: #7f1d1d; color: #fca5a5; border: 1px solid #ef4444; }}
-  .badge.Oczekiwanie\\.\\.\\. {{ background: #334155; color: #cbd5e1; }}
-  .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px; }}
-  .stat {{ background: #0b1120; border: 1px solid var(--border); padding: 14px; border-radius: 8px; }}
-  .stat span {{ display: block; font-size: 0.75rem; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; }}
-  .stat b {{ font-size: 0.95rem; font-weight: 600; }}
-  .actions {{ display: flex; gap: 10px; margin-bottom: 20px; }}
-  button {{ border: 0; padding: 9px 16px; border-radius: 6px; font-weight: 600; font-size: 0.85rem; cursor: pointer; }}
-  button:hover {{ opacity: 0.9; }}
-  .btn-primary {{ background: #2563eb; color: #fff; }}
-  .btn-danger {{ background: #dc2626; color: #fff; }}
-  .console {{ background: #020617; border: 1px solid var(--border); border-radius: 8px; padding: 14px; font-family: monospace; font-size: 0.75rem; color: #cbd5e1; max-height: 280px; overflow-y: auto; line-height: 1.5; white-space: pre-wrap; }}
-</style>
+    <meta charset="UTF-8">
+    <title>OMADA_WATCHDOG // ROOT_ACCESS</title>
+    <style>
+        :root {{
+            --matrix-green: #00ff66;
+            --matrix-glow: rgba(0, 255, 102, 0.4);
+            --matrix-dim: #003b14;
+            --matrix-red: #ff3333;
+            --mouse-x: 50vw;
+            --mouse-y: 50vh;
+        }}
+        * {{ box-sizing: border-box; }}
+        body {{
+            margin: 0;
+            padding: 30px 20px;
+            font-family: "Consolas", "Courier New", monospace;
+            background-color: #030804;
+            background-image: radial-gradient(700px circle at var(--mouse-x) var(--mouse-y), rgba(0, 255, 102, 0.08), transparent 70%);
+            background-attachment: fixed;
+            color: var(--matrix-green);
+            min-height: 100vh;
+        }}
+        .container {{ max-width: 900px; margin: 0 auto; }}
+        .panel {{
+            background: rgba(3, 14, 6, 0.82);
+            border: 1px solid var(--matrix-green);
+            box-shadow: 0 0 15px var(--matrix-dim), inset 0 0 10px rgba(0, 255, 102, 0.05);
+            padding: 24px;
+            margin-bottom: 24px;
+            position: relative;
+        }}
+        .panel::before {{
+            content: "// SECURE_SYSTEM_SHELL";
+            position: absolute;
+            top: -9px;
+            left: 16px;
+            background: #030804;
+            padding: 0 8px;
+            font-size: 11px;
+            letter-spacing: 2px;
+            color: #00ff66;
+            opacity: 0.8;
+        }}
+        .header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px dashed var(--matrix-dim);
+            padding-bottom: 16px;
+            margin-bottom: 20px;
+        }}
+        h1 {{
+            margin: 0;
+            font-size: 20px;
+            letter-spacing: 2px;
+            text-shadow: 0 0 8px var(--matrix-glow);
+        }}
+        .badge {{
+            padding: 4px 12px;
+            font-size: 14px;
+            letter-spacing: 2px;
+            border: 1px solid currentColor;
+            font-weight: bold;
+        }}
+        .badge.online {{
+            color: #00ff66;
+            border-color: #00ff66;
+            box-shadow: 0 0 10px rgba(0, 255, 102, 0.5);
+        }}
+        .badge.offline {{
+            color: var(--matrix-red);
+            border-color: var(--matrix-red);
+            box-shadow: 0 0 10px rgba(255, 51, 51, 0.5);
+            animation: pulse 1s infinite alternate;
+        }}
+        @keyframes pulse {{
+            from {{ opacity: 0.4; }}
+            to {{ opacity: 1; }}
+        }}
+        .grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px;
+            margin-bottom: 20px;
+        }}
+        .stat {{
+            background: rgba(0, 255, 102, 0.03);
+            border: 1px solid var(--matrix-dim);
+            padding: 12px;
+        }}
+        .stat-label {{
+            font-size: 11px;
+            color: #559966;
+            letter-spacing: 1px;
+            margin-bottom: 4px;
+        }}
+        .stat-value {{
+            font-size: 16px;
+            font-weight: bold;
+            color: #fff;
+            text-shadow: 0 0 5px var(--matrix-green);
+        }}
+        .actions {{ display: flex; gap: 12px; margin-top: 10px; }}
+        .btn {{
+            background: transparent;
+            color: var(--matrix-green);
+            border: 1px solid var(--matrix-green);
+            padding: 10px 20px;
+            font-family: inherit;
+            font-size: 13px;
+            letter-spacing: 1px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            box-shadow: 0 0 8px rgba(0, 255, 102, 0.2);
+        }}
+        .btn:hover {{
+            background: var(--matrix-green);
+            color: #000;
+            box-shadow: 0 0 16px var(--matrix-green);
+        }}
+        .btn-danger {{
+            color: var(--matrix-red);
+            border-color: var(--matrix-red);
+            box-shadow: 0 0 8px rgba(255, 51, 51, 0.2);
+        }}
+        .btn-danger:hover {{
+            background: var(--matrix-red);
+            color: #000;
+            box-shadow: 0 0 16px var(--matrix-red);
+        }}
+        .chart-box {{
+            margin-top: 10px;
+            background: rgba(0, 10, 3, 0.9);
+            border: 1px solid var(--matrix-dim);
+            padding: 12px;
+        }}
+        svg text {{
+            font-family: Consolas, monospace;
+            font-size: 10px;
+            fill: #559966;
+        }}
+        pre {{
+            margin: 0;
+            padding: 12px;
+            background: rgba(0, 5, 2, 0.95);
+            border: 1px solid var(--matrix-dim);
+            color: #88cc99;
+            font-size: 12px;
+            line-height: 1.5;
+            max-height: 240px;
+            overflow-y: auto;
+        }}
+    </style>
 </head>
 <body>
-<div class="container">
-  <div class="card">
-    <div class="header">
-      <h1>Omada ER605 Watchdog</h1>
-      <span class="badge {status}">{status}</span>
-    </div>
-    <div class="grid">
-      <div class="stat"><span>Ostatnie sprawdzenie</span><b>{last_check}</b></div>
-      <div class="stat"><span>Ostatni restart routera</span><b>{last_reboot}</b></div>
-    </div>
-    <div class="actions">
-      <form method="POST" action="/check" style="margin:0;"><button type="submit" class="btn-primary">Sprawdź teraz</button></form>
-      <form method="POST" action="/reboot" style="margin:0;" onsubmit="return confirm('Wymusić restart ER605?');"><button type="submit" class="btn-danger">Wymuś restart ER605</button></form>
-    </div>
-    <div style="font-size: 0.75rem; color: var(--muted); margin-bottom: 6px;">Dziennik operacji:</div>
-    <div class="console">{logs}</div>
-  </div>
-</div>
-</body>
-</html>'''
+    <div class="container">
+        <div class="panel">
+            <div class="header">
+                <h1>&gt; OMADA_WATCHDOG [ER605]</h1>
+                <span class="badge { 'online' if state['last_status'] == 'ONLINE' else 'offline' }">[ {state['last_status']} ]</span>
+            </div>
 
-class WebHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        page = HTML_PAGE.format(
-            status=state['status'],
-            last_check=state['last_check'],
-            last_reboot=state['last_reboot'],
-            logs='\\n'.join(state['logs'])
-        )
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/html; charset=utf-8')
-        self.end_headers()
-        self.wfile.write(page.encode('utf-8'))
+            <div class="grid">
+                <div class="stat">
+                    <div class="stat-label">TARGET_DEVICE</div>
+                    <div class="stat-value">{CONFIG.get('target_mac')}</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">LAST_LATENCY</div>
+                    <div class="stat-value">{state.get('last_latency_ms') or '--'} ms</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">LAST_CHECK</div>
+                    <div class="stat-value">{state.get('last_check') or 'N/A'}</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">COOLDOWN_STATE</div>
+                    <div class="stat-value">{cooldown_str}</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">FAIL_COUNTER</div>
+                    <div class="stat-value">{state.get('consecutive_failures', 0)} / {CONFIG.get('max_retries', 3)}</div>
+                </div>
+            </div>
+
+            <div class="actions">
+                <form method="POST" action="/check" style="margin:0;">
+                    <button class="btn" type="submit">&gt; CHECK_NOW()</button>
+                </form>
+                <form method="POST" action="/reboot" style="margin:0;" onsubmit="return confirm('WARNING: Wymusić restart routera ER605 natychmiast?');">
+                    <button class="btn btn-danger" type="submit">&gt; FORCE_REBOOT_ER605()</button>
+                </form>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="stat-label" style="margin-bottom:8px;">// LATENCY & STATUS TIMELINE (LAST 24 HOURS)</div>
+            <div class="chart-box">
+                <svg id="chart" viewBox="0 0 800 160" width="100%" height="160"></svg>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="stat-label" style="margin-bottom:8px;">// SYSTEM_EVENT_LOG</div>
+            <pre>{logs_html}</pre>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('mousemove', (e) => {{
+            document.documentElement.style.setProperty('--mouse-x', e.clientX + 'px');
+            document.documentElement.style.setProperty('--mouse-y', e.clientY + 'px');
+        }});
+
+        const historyData = {history_json};
+        const svg = document.getElementById('chart');
+
+        function drawChart() {{
+            svg.innerHTML = '';
+            const w = 800, h = 160, pad = 30;
+            const innerW = w - pad * 2, innerH = h - pad * 2;
+
+            svg.innerHTML += `<line x1="${{pad}}" y1="${{pad}}" x2="${{w-pad}}" y2="${{pad}}" stroke="#003b14" stroke-dasharray="4" />`;
+            svg.innerHTML += `<line x1="${{pad}}" y1="${{pad + innerH/2}}" x2="${{w-pad}}" y2="${{pad + innerH/2}}" stroke="#003b14" stroke-dasharray="4" />`;
+            svg.innerHTML += `<line x1="${{pad}}" y1="${{h-pad}}" x2="${{w-pad}}" y2="${{h-pad}}" stroke="#00ff66" stroke-width="1.5" />`;
+
+            if (!historyData || historyData.length === 0) {{
+                svg.innerHTML += `<text x="${{w/2}}" y="${{h/2}}" text-anchor="middle" fill="#559966">// Oczekiwanie na próbki danych z kolejnych sprawdzeń...</text>`;
+                return;
+            }}
+
+            const maxMs = Math.max(50, ...historyData.map(d => d.ms || 0));
+            svg.innerHTML += `<text x="${{pad - 5}}" y="${{pad + 4}}" text-anchor="end">${{Math.round(maxMs)}}ms</text>`;
+            svg.innerHTML += `<text x="${{pad - 5}}" y="${{h - pad}}" text-anchor="end">0ms</text>`;
+
+            const pts = historyData.map((d, i) => {{
+                const x = pad + (i / Math.max(1, historyData.length - 1)) * innerW;
+                const normY = d.status === 'ONLINE' ? (d.ms / maxMs) : 0;
+                const y = (h - pad) - normY * innerH;
+                return {{ x, y, ...d }};
+            }});
+
+            pts.forEach(p => {{
+                const col = p.status === 'ONLINE' ? '#00ff66' : '#ff3333';
+                svg.innerHTML += `<line x1="${{p.x}}" y1="${{h-pad}}" x2="${{p.x}}" y2="${{p.y}}" stroke="${{col}}" stroke-width="3" opacity="0.6"/>`;
+                svg.innerHTML += `<circle cx="${{p.x}}" cy="${{p.y}}" r="4" fill="${{col}}" stroke="#030804" stroke-width="2"/>`;
+                svg.innerHTML += `<text x="${{p.x}}" y="${{h - pad + 15}}" text-anchor="middle" font-size="9">${{p.time}}</text>`;
+            }});
+        }}
+        drawChart();
+    </script>
+</body>
+</html>
+"""
+        self.wfile.write(html.encode("utf-8"))
 
     def do_POST(self):
-        if self.path == '/check':
+        if self.path == "/check":
             threading.Thread(target=run_watchdog, args=(True,)).start()
-        elif self.path == '/reboot':
-            threading.Thread(target=lambda: [log('Ręczne wymuszenie restartu...'), reboot_er605()]).start()
+        elif self.path == "/reboot":
+            threading.Thread(target=reboot_router).start()
         self.send_response(303)
-        self.send_header('Location', '/')
+        self.send_header("Location", "/")
         self.end_headers()
 
-if __name__ == '__main__':
-    threading.Thread(target=scheduler_thread, daemon=True).start()
-    with socketserver.TCPServer(('', PORT), WebHandler) as server:
-        server.serve_forever()
-PYEOF
+def run_server():
+    server = HTTPServer(("0.0.0.0", CONFIG.get("web_port", 8080)), RequestHandler)
+    server.serve_forever()
 
-pct push "$CTID" "$TMP_APP" /opt/omada-watchdog/app.py --perms 0755
+if __name__ == "__main__":
+    t_watchdog = threading.Thread(target=watchdog_loop, daemon=True)
+    t_watchdog.start()
+    run_server()
+EOF
 
-TMP_SVC="${TMP_DIR}/omada-watchdog.service"
-cat << 'SVCEOF' > "$TMP_SVC"
+pct push "$CT_ID" "$TMP_APP" /opt/omada-watchdog/app.py
+rm -f "$TMP_APP"
+
+pct exec "$CT_ID" -- bash -c "cat << 'EOF' > /etc/systemd/system/omada-watchdog.service
 [Unit]
 Description=Omada ER605 Watchdog Service
 After=network.target
@@ -535,27 +708,18 @@ RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
-SVCEOF
+EOF
+"
 
-pct push "$CTID" "$TMP_SVC" /etc/systemd/system/omada-watchdog.service --perms 0644
+echo ">> Aktywacja usługi..."
+pct exec "$CT_ID" -- systemctl daemon-reload
+pct exec "$CT_ID" -- systemctl enable --now omada-watchdog
 
-echo -e "${YELLOW}>> Aktywacja i start usługi w kontenerze...${NC}"
-pct exec "$CTID" -- systemctl daemon-reload
-pct exec "$CTID" -- systemctl enable --now omada-watchdog.service
+FINAL_IP=$(pct exec "$CT_ID" -- ip -4 addr show eth0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || echo "$CT_IP")
 
-LXC_IP=""
-for i in {1..10}; do
-    LXC_IP=$(pct exec "$CTID" -- ip -4 addr show eth0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1 || true)
-    if [ -n "$LXC_IP" ]; then
-        break
-    fi
-    sleep 1
-done
-
-echo -e "\n${GREEN}${BOLD}================================================================${NC}"
-echo -e "${GREEN}${BOLD}  INSTALACJA ZAKOŃCZONA SUKCESEM!${NC}"
-echo -e "${BOLD}  Kontener ID:${NC}       ${CYAN}${CTID}${NC}"
-echo -e "${BOLD}  Adres IP:${NC}           ${CYAN}${LXC_IP:-DHCP}${NC}"
-echo -e "${BOLD}  Panel Web UI:${NC}       ${YELLOW}http://${LXC_IP:-IP_KONTENERA}:${WEB_PORT}${NC}"
-echo -e "${BOLD}  Router:${NC}             ${GREEN}${RESOLVED_ROUTER_NAME}${NC} (${ER605_MAC})"
-echo -e "${GREEN}${BOLD}================================================================${NC}\n"
+echo "================================================================"
+echo "  INSTALACJA ZAKOŃCZONA SUKCESEM!"
+echo "  Kontener ID:  $CT_ID"
+echo "  Adres IP:     $FINAL_IP"
+echo "  Panel Web UI: http://${FINAL_IP}:${WEB_PORT}"
+echo "================================================================"
