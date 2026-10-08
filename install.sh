@@ -2,7 +2,7 @@
 # ==============================================================================
 # Omada ER605 Watchdog LXC Installer for Proxmox VE
 # Style: Proxmox Community Helper-Scripts
-# Bezpieczne przekazywanie poświadczeń przez sys.argv + JSON + pct push
+# Z weryfikacją API i automatycznym wykrywaniem ER605 przed utworzeniem kontenera
 # ==============================================================================
 set -euo pipefail
 
@@ -14,7 +14,6 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# Weryfikacja środowiska hosta Proxmox VE
 if ! command -v pveversion >/dev/null 2>&1; then
     echo -e "${RED}Błąd: Ten instalator musi być uruchomiony bezpośrednio w powłoce Proxmox VE (PVE Shell)!${NC}"
     exit 1
@@ -37,7 +36,6 @@ cat << "EOF"
 EOF
 echo -e "${NC}${GREEN}Autoinstalator LXC dla Omada ER605 Watchdog (PVE 7 / 8 / 9)${NC}\n"
 
-# Bezpieczne odczytywanie wejścia z /dev/tty (wymóg dla potoków curl | bash)
 prompt() {
     local var_name="$1"
     local prompt_text="$2"
@@ -70,7 +68,7 @@ prompt_secret() {
     done
 }
 
-echo -e "${BLUE}--- [1/3] Parametry kontenera LXC ---${NC}"
+echo -e "${BLUE}--- [1/4] Parametry kontenera LXC ---${NC}"
 NEXT_ID=$(pvesh get /cluster/nextid)
 prompt CTID "Numer ID nowego kontenera" "$NEXT_ID"
 prompt HOSTNAME "Nazwa hosta" "omada-watchdog"
@@ -78,7 +76,6 @@ prompt RAM "Pamięć RAM w MB" "512"
 prompt DISK "Rozmiar dysku w GB" "2"
 prompt WEB_PORT "Port Web UI" "8080"
 
-# Wykrycie pamięci masowej
 STORAGE="local-lvm"
 if ! pvesm status -storage "$STORAGE" &>/dev/null; then
     STORAGE="local-zfs"
@@ -88,27 +85,137 @@ if ! pvesm status -storage "$STORAGE" &>/dev/null; then
 fi
 prompt TARGET_STORAGE "Storage dla rootfs" "$STORAGE"
 
-echo -e "\n${BLUE}--- [2/3] Konfiguracja Omada Open API ---${NC}"
-prompt OMADA_URL "Adres URL kontrolera" "https://192.168.0.4"
-prompt_secret CLIENT_ID "Omada Client ID"
-prompt_secret CLIENT_SECRET "Omada Client Secret"
+echo -e "\n${BLUE}--- [2/4] Konfiguracja Omada Open API ---${NC}"
 
+# Pętla wprowadzania i walidacji poświadczeń
 while true; do
-    echo -ne "${BOLD}Adres MAC routera ER605 (np. AA-BB-CC-DD-EE-FF)${NC}: "
-    read -r RAW_MAC </dev/tty || true
-    CLEAN_MAC=$(echo "$RAW_MAC" | tr '[:lower:]' '[:upper:]' | tr ':' '-')
-    if [[ "$CLEAN_MAC" =~ ^([0-9A-F]{2}-){5}[0-9A-F]{2}$ ]]; then
-        ER605_MAC="$CLEAN_MAC"
+    prompt OMADA_URL "Adres URL kontrolera" "https://192.168.0.4"
+    prompt_secret CLIENT_ID "Omada Client ID"
+    prompt_secret CLIENT_SECRET "Omada Client Secret"
+
+    while true; do
+        echo -ne "${BOLD}Adres MAC routera ER605 (np. AA-BB-CC-DD-EE-FF)${NC}: "
+        read -r RAW_MAC </dev/tty || true
+        CLEAN_MAC=$(echo "$RAW_MAC" | tr '[:lower:]' '[:upper:]' | tr ':' '-')
+        if [[ "$CLEAN_MAC" =~ ^([0-9A-F]{2}-){5}[0-9A-F]{2}$ ]]; then
+            ER605_MAC="$CLEAN_MAC"
+            break
+        fi
+        echo -e "${RED}Nieprawidłowy format. Podaj MAC w formacie XX-XX-XX-XX-XX-XX lub XX:XX:XX:XX:XX:XX${NC}"
+    done
+
+    echo -e "\n${YELLOW}>> Sprawdzanie połączenia z kontrolerem i weryfikacja routera...${NC}"
+
+    # Bezpieczna walidacja przez Pythona (sys.argv, brak podatności na znaki specjalne)
+    VALIDATION_RESULT=$(python3 - "$OMADA_URL" "$CLIENT_ID" "$CLIENT_SECRET" "$ER605_MAC" << 'PYCHECK' 2>&1 || true
+import sys, json, urllib.request, ssl
+
+url = sys.argv[1].rstrip('/')
+client_id = sys.argv[2]
+client_secret = sys.argv[3]
+target_mac = sys.argv[4].upper().replace(':', '-')
+
+ctx = ssl._create_unverified_context()
+
+# 1. Test /api/info
+try:
+    req = urllib.request.Request(f"{url}/api/info")
+    with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+        info = json.loads(r.read().decode())
+    omadac_id = info.get("result", {}).get("omadacId")
+    ctrl_name = info.get("result", {}).get("controllerName", "Omada")
+    if not omadac_id:
+        print(f"ERR:Kontroler odpowiedział, ale brak pola omadacId. Upewnij się, że adres wskazuje na kontroler.")
+        sys.exit(0)
+except Exception as e:
+    print(f"ERR:Nie można połączyć się z kontrolerem pod {url}: {e}")
+    sys.exit(0)
+
+# 2. Test autoryzacji OAuth
+try:
+    auth_data = json.dumps({"omadacId": omadac_id, "client_id": client_id, "client_secret": client_secret}).encode()
+    req = urllib.request.Request(f"{url}/openapi/authorize/token?grant_type=client_credentials", data=auth_data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+        token_res = json.loads(r.read().decode())
+    token = token_res.get("result", {}).get("accessToken")
+    if not token:
+        msg = token_res.get("msg", "Błędne poświadczenia")
+        print(f"ERR:Błąd logowania do Open API ({msg}). Sprawdź Client ID i Secret.")
+        sys.exit(0)
+except Exception as e:
+    print(f"ERR:Wyjątek podczas autoryzacji tokena: {e}")
+    sys.exit(0)
+
+# 3. Pobranie listy Site'ów i urządzeń
+try:
+    req = urllib.request.Request(f"{url}/openapi/v1/{omadac_id}/sites?pageSize=20", headers={"Authorization": f"AccessToken={token}"})
+    with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+        sites_res = json.loads(r.read().decode())
+    sites = sites_res.get("result", {}).get("data", [])
+    if not sites:
+        sites = [{"siteId": "Default", "name": "Default"}]
+
+    found_device = None
+    all_devices = []
+
+    for site in sites:
+        s_id = site.get("siteId")
+        d_req = urllib.request.Request(f"{url}/openapi/v1/{omadac_id}/sites/{s_id}/devices?pageSize=100", headers={"Authorization": f"AccessToken={token}"})
+        with urllib.request.urlopen(d_req, context=ctx, timeout=8) as r:
+            dev_res = json.loads(r.read().decode())
+        devs = dev_res.get("result", {}).get("data", []) or dev_res.get("result", [])
+        for d in devs:
+            d_mac = d.get("mac", "").upper().replace(':', '-')
+            d_model = d.get("model", d.get("deviceCategory", "Urządzenie"))
+            d_name = d.get("name", d_model)
+            all_devices.append(f"{d_name} ({d_model}) - MAC: {d_mac}")
+            if d_mac == target_mac:
+                found_device = (d_name, d_model, site.get("name", s_id))
+                break
+        if found_device:
+            break
+
+    if found_device:
+        print(f"OK:{ctrl_name}|{found_device[0]}|{found_device[1]}|{found_device[2]}")
+    else:
+        dev_list = "\\n  - ".join(all_devices) if all_devices else "Brak zaadoptowanych urządzeń."
+        print(f"WARN:Nie znaleziono routera o MAC {target_mac}. Wykryte urządzenia w kontrolerze:\\n  - {dev_list}")
+except Exception as e:
+    print(f"ERR:Błąd pobierania listy urządzeń: {e}")
+PYCHECK
+)
+
+    if [[ "$VALIDATION_RESULT" =~ ^OK: ]]; then
+        DETAILS=${VALIDATION_RESULT#OK:}
+        IFS='|' read -r C_NAME D_NAME D_MODEL D_SITE <<< "$DETAILS"
+        echo -e "${GREEN}${BOLD}✓ Połączenie z API powiodło się!${NC}"
+        echo -e "  Kontroler: ${CYAN}${C_NAME}${NC}"
+        echo -e "  Znaleziony router: ${GREEN}${BOLD}${D_NAME} (${D_MODEL})${NC} w witrynie [${D_SITE}]"
+        echo -e "  Zweryfikowany MAC: ${CYAN}${ER605_MAC}${NC}\n"
         break
+    elif [[ "$VALIDATION_RESULT" =~ ^WARN: ]]; then
+        echo -e "${YELLOW}${BOLD}! Uwaga:${NC} ${VALIDATION_RESULT#WARN:}\n"
+        echo -ne "${BOLD}Czy chcesz kontynuować mimo to? (t/N)${NC}: "
+        read -r CONFIRM </dev/tty || true
+        if [[ "$CONFIRM" =~ ^[tTyY]$ ]]; then
+            break
+        fi
+    else
+        ERR_MSG=${VALIDATION_RESULT#ERR:}
+        echo -e "${RED}${BOLD}✗ Weryfikacja nie powiodła się:${NC} ${ERR_MSG}\n"
+        echo -ne "${BOLD}Czy chcesz spróbować wprowadzić dane ponownie? (T/n)${NC}: "
+        read -r RETRY </dev/tty || true
+        if [[ "$RETRY" =~ ^[nN]$ ]]; then
+            echo -e "${RED}Przerwano instalację.${NC}"
+            exit 1
+        fi
     fi
-    echo -e "${RED}Nieprawidłowy format. Podaj MAC w formacie XX-XX-XX-XX-XX-XX lub XX:XX:XX:XX:XX:XX${NC}"
 done
 
 prompt COOLDOWN "Czas cooldownu po restarcie (w godzinach)" "3"
 
-echo -e "\n${BLUE}--- [3/3] Przygotowanie i tworzenie kontenera ---${NC}"
+echo -e "\n${BLUE}--- [3/4] Przygotowanie i tworzenie kontenera ---${NC}"
 
-# Sprawdzenie i pobranie szablonu Debiana 12
 echo -e "${YELLOW}>> Aktualizacja listy szablonów PVE...${NC}"
 pveam update >/dev/null 2>&1 || true
 
@@ -133,7 +240,7 @@ pct create "$CTID" "local:vztmpl/$TEMPLATE" \
     --onboot 1 \
     --start 1
 
-echo -e "${YELLOW}>> Oczekiwanie na inicjalizację sieci w kontenerze...${NC}"
+echo -e "${YELLOW}>> Oczekiwanie na sieć w kontenerze...${NC}"
 for i in {1..20}; do
     if pct exec "$CTID" -- ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1; then
         break
@@ -141,39 +248,35 @@ for i in {1..20}; do
     sleep 1
 done
 
-echo -e "${YELLOW}>> Instalacja pakietów w LXC (python3, iputils-ping, curl, ca-certificates)...${NC}"
+echo -e "${YELLOW}>> Instalacja pakietów w LXC (python3, ping, curl)...${NC}"
 pct exec "$CTID" -- bash -c "apt-get update -qq && apt-get install -y -qq python3 iputils-ping curl ca-certificates" >/dev/null
 pct exec "$CTID" -- mkdir -p /opt/omada-watchdog /etc
 
-# Bezpieczne tworzenie pliku JSON na hoście za pomocą Pythona (przekazanie przez sys.argv)
+echo -e "\n${BLUE}--- [4/4] Bezpieczne wgrywanie konfiguracji i start serwisu ---${NC}"
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 TMP_CONFIG="${TMP_DIR}/config.json"
 touch "$TMP_CONFIG"
 chmod 600 "$TMP_CONFIG"
 
+# Bezpieczny zapis do pliku JSON bez interpolacji w powłoce
 python3 - "$TMP_CONFIG" "$OMADA_URL" "$CLIENT_ID" "$CLIENT_SECRET" "$ER605_MAC" "$COOLDOWN" "$WEB_PORT" << 'PYGEN'
-import sys
-import json
+import sys, json
 
-target_file = sys.argv[1]
-data = {
-    "OMADA_URL": sys.argv[2].rstrip('/'),
-    "CLIENT_ID": sys.argv[3],
-    "CLIENT_SECRET": sys.argv[4],
-    "ER605_MAC": sys.argv[5],
-    "COOLDOWN_HOURS": int(sys.argv[6]),
-    "PORT": int(sys.argv[7])
-}
-
-with open(target_file, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2, ensure_ascii=False)
+with open(sys.argv[1], "w", encoding="utf-8") as f:
+    json.dump({
+        "OMADA_URL": sys.argv[2].rstrip('/'),
+        "CLIENT_ID": sys.argv[3],
+        "CLIENT_SECRET": sys.argv[4],
+        "ER605_MAC": sys.argv[5],
+        "COOLDOWN_HOURS": int(sys.argv[6]),
+        "PORT": int(sys.argv[7])
+    }, f, indent=2, ensure_ascii=False)
 PYGEN
 
 echo -e "${YELLOW}>> Wgrywanie pliku konfiguracyjnego przez pct push...${NC}"
 pct push "$CTID" "$TMP_CONFIG" /etc/omada-watchdog.json --perms 0600
 
-# Przygotowanie statycznego kodu aplikacji w pliku tymczasowym
 TMP_APP="${TMP_DIR}/app.py"
 cat << 'PYEOF' > "$TMP_APP"
 #!/usr/bin/env python3
@@ -193,7 +296,7 @@ try:
     with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
         config = json.load(f)
 except Exception as e:
-    print(f'KRYTYCZNY BŁĄD: Nie można wczytać pliku {CONFIG_PATH}: {e}')
+    print(f'BŁĄD: Nie można wczytać pliku {CONFIG_PATH}: {e}')
     raise SystemExit(1)
 
 OMADA_URL = config.get('OMADA_URL', '').rstrip('/')
@@ -243,7 +346,7 @@ def get_omada_token(ctx):
         info_data = json.loads(r.read().decode())
     omadac_id = info_data.get('result', {}).get('omadacId')
     if not omadac_id:
-        raise Exception('Brak omadacId w odpowiedzi kontrolera.')
+        raise Exception('Brak omadacId w kontrolerze.')
 
     auth_payload = json.dumps({'omadacId': omadac_id, 'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET}).encode('utf-8')
     auth_req = urllib.request.Request(
@@ -256,7 +359,7 @@ def get_omada_token(ctx):
     
     token = token_data.get('result', {}).get('accessToken')
     if not token:
-        err = token_data.get('msg', 'Brak accessToken w odpowiedzi')
+        err = token_data.get('msg', 'Brak tokena')
         raise Exception(f'Błąd logowania Open API: {err}')
     return omadac_id, token
 
@@ -287,7 +390,7 @@ def reboot_er605():
 
 def run_watchdog(manual=False):
     prefix = ' (test ręczny)' if manual else ''
-    log(f'Sprawdzanie stanu połączenia z internetem{prefix}...')
+    log(f'Sprawdzanie połączenia{prefix}...')
     online = check_internet()
     state['last_check'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
@@ -305,7 +408,7 @@ def run_watchdog(manual=False):
 
     if elapsed < cooldown_sec and not manual:
         rem = int((cooldown_sec - elapsed) / 60)
-        log(f'Cooldown aktywny. Restart routera wstrzymany na jeszcze {rem} min.')
+        log(f'Cooldown aktywny. Restart routera wstrzymany na {rem} min.')
         return
 
     try:
@@ -313,9 +416,9 @@ def run_watchdog(manual=False):
         reboot_er605()
         state['last_reboot_ts'] = now
         state['last_reboot'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        log('SUKCES: Router ER605 został pomyślnie zrestartowany przez API!')
+        log('SUKCES: Router ER605 został zrestartowany przez API!')
     except Exception as e:
-        log(f'BŁĄD procedury restartu: {e}')
+        log(f'BŁĄD restartu: {e}')
 
 def scheduler_thread():
     time.sleep(5)
@@ -336,7 +439,7 @@ HTML_PAGE = '''<!DOCTYPE html>
   .card {{ background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.4); }}
   .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }}
   h1 {{ font-size: 1.25rem; margin: 0; font-weight: 600; }}
-  .badge {{ padding: 5px 12px; border-radius: 999px; font-size: 0.8rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }}
+  .badge {{ padding: 5px 12px; border-radius: 999px; font-size: 0.8rem; font-weight: 700; text-transform: uppercase; }}
   .badge.ONLINE {{ background: #14532d; color: #86efac; border: 1px solid #22c55e; }}
   .badge.OFFLINE {{ background: #7f1d1d; color: #fca5a5; border: 1px solid #ef4444; }}
   .badge.Oczekiwanie\\.\\.\\. {{ background: #334155; color: #cbd5e1; }}
@@ -365,7 +468,7 @@ HTML_PAGE = '''<!DOCTYPE html>
     </div>
     <div class="actions">
       <form method="POST" action="/check" style="margin:0;"><button type="submit" class="btn-primary">Sprawdź teraz</button></form>
-      <form method="POST" action="/reboot" style="margin:0;" onsubmit="return confirm('Wymusić natychmiastowy restart ER605?');"><button type="submit" class="btn-danger">Wymuś restart ER605</button></form>
+      <form method="POST" action="/reboot" style="margin:0;" onsubmit="return confirm('Wymusić restart ER605?');"><button type="submit" class="btn-danger">Wymuś restart ER605</button></form>
     </div>
     <div style="font-size: 0.75rem; color: var(--muted); margin-bottom: 6px;">Dziennik operacji:</div>
     <div class="console">{logs}</div>
@@ -402,10 +505,8 @@ if __name__ == '__main__':
         server.serve_forever()
 PYEOF
 
-echo -e "${YELLOW}>> Wgrywanie kodu aplikacji do /opt/omada-watchdog/app.py...${NC}"
 pct push "$CTID" "$TMP_APP" /opt/omada-watchdog/app.py --perms 0755
 
-# Przygotowanie i wgranie pliku usługi systemd
 TMP_SVC="${TMP_DIR}/omada-watchdog.service"
 cat << 'SVCEOF' > "$TMP_SVC"
 [Unit]
@@ -426,11 +527,10 @@ SVCEOF
 
 pct push "$CTID" "$TMP_SVC" /etc/systemd/system/omada-watchdog.service --perms 0644
 
-echo -e "${YELLOW}>> Uruchamianie usługi w LXC...${NC}"
+echo -e "${YELLOW}>> Aktywacja i start usługi w kontenerze...${NC}"
 pct exec "$CTID" -- systemctl daemon-reload
 pct exec "$CTID" -- systemctl enable --now omada-watchdog.service
 
-# Pobranie adresu IP kontenera
 LXC_IP=""
 for i in {1..10}; do
     LXC_IP=$(pct exec "$CTID" -- ip -4 addr show eth0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1 || true)
@@ -445,5 +545,5 @@ echo -e "${GREEN}${BOLD}  INSTALACJA ZAKOŃCZONA SUKCESEM!${NC}"
 echo -e "${BOLD}  Kontener ID:${NC}       ${CYAN}${CTID}${NC}"
 echo -e "${BOLD}  Adres IP:${NC}           ${CYAN}${LXC_IP:-DHCP}${NC}"
 echo -e "${BOLD}  Panel Web UI:${NC}       ${YELLOW}http://${LXC_IP:-IP_KONTENERA}:${WEB_PORT}${NC}"
-echo -e "${BOLD}  Plik konfiguracji:${NC}  ${CYAN}/etc/omada-watchdog.json${NC} (wewnątrz LXC, uprawnienia 0600)"
+echo -e "${BOLD}  Router:${NC}             ${GREEN}${D_NAME:-ER605} (${ER605_MAC})${NC}"
 echo -e "${GREEN}${BOLD}================================================================${NC}\n"
