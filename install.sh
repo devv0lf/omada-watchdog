@@ -38,7 +38,8 @@ prompt() {
         else
             read -r -e -p "$question: " input </dev/tty || true
         fi
-        input="$(echo -n "$input" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        # Usunięcie spacji i znaków kontrolnych
+        input="$(echo -n "$input" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/\r//g')"
         if [ -n "$input" ]; then
             printf -v "$var_name" "%s" "$input"
             break
@@ -66,7 +67,7 @@ prompt OMADA_URL "Adres URL kontrolera" "https://192.168.0.4"
 prompt OMADA_ID "Omada ID (z Open API Attributes)" ""
 prompt CLIENT_ID "Omada Client ID" ""
 prompt CLIENT_SECRET "Omada Client Secret" ""
-prompt TARGET_MAC "Adres MAC routera ER605" ""
+prompt TARGET_MAC "Adres MAC routera ER605 (np. B8-FB-B3-2D-B4-5E)" ""
 TARGET_MAC=$(echo "$TARGET_MAC" | tr '[:lower:]' '[:upper:]' | tr ':' '-')
 
 echo ">> Weryfikacja połączenia i wyszukiwanie routera w Omada API..."
@@ -77,6 +78,7 @@ url, omadac_id, client_id, client_secret, target_mac = sys.argv[1:6]
 ctx = ssl._create_unverified_context()
 
 try:
+    # 1. Pobranie tokenu
     token_url = f"{url.rstrip('/')}/openapi/authorize/token?grant_type=client_credentials"
     auth_data = json.dumps({"omadacId": omadac_id, "client_id": client_id, "client_secret": client_secret}).encode()
     req = urllib.request.Request(token_url, data=auth_data, headers={"Content-Type": "application/json"})
@@ -88,8 +90,10 @@ try:
         sys.exit(1)
         
     token = token_res['result']['accessToken']
-    headers = {"AccessToken": token, "Content-Type": "application/json"}
+    # Właściwy nagłówek autoryzacji Omada Open API:
+    headers = {"Authorization": f"AccessToken={token}", "Content-Type": "application/json"}
 
+    # 2. Pobranie witryn
     sites_url = f"{url.rstrip('/')}/openapi/v1/{omadac_id}/sites?page=1&pageSize=100"
     req_sites = urllib.request.Request(sites_url, headers=headers)
     with urllib.request.urlopen(req_sites, context=ctx, timeout=10) as r:
@@ -100,6 +104,7 @@ try:
         print("ERROR: Brak witryn przypisanych do aplikacji w kontrolerze.")
         sys.exit(1)
 
+    # 3. Wyszukiwanie urządzenia po MAC
     found_site = None
     device_info = None
     for s in sites:
@@ -125,7 +130,7 @@ try:
         print(device_info.get('name', 'Brak'))
         print(device_info.get('model', 'ER605'))
     else:
-        print(f"NOT_FOUND: Nie znaleziono urządzenia o MAC {target_mac}.")
+        print(f"NOT_FOUND: Nie znaleziono urządzenia o MAC {target_mac} w żadnej witrynie.")
         sys.exit(2)
 
 except Exception as e:
@@ -142,14 +147,15 @@ if [ "$STATUS" == "SUCCESS" ]; then
     DEV_NAME=$(echo "$VERIFY_OUTPUT" | sed -n '4p')
     DEV_MODEL=$(echo "$VERIFY_OUTPUT" | sed -n '5p')
     echo "✓ Połączenie z API powiodło się!"
-    echo "  Router:  $DEV_NAME ($DEV_MODEL)"
-    echo "  Witryna: $SITE_NAME (ID: $SITE_ID)"
+    echo "  Znaleziony router: $DEV_NAME ($DEV_MODEL)"
+    echo "  Witryna:           $SITE_NAME (ID: $SITE_ID)"
+    echo "  Zweryfikowany MAC: $TARGET_MAC"
 else
     echo "[-] Ostrzeżenie weryfikacji:"
     echo "$VERIFY_OUTPUT"
-    read -r -p "Kontynuować mimo to? (t/N): " FORCE_CONT </dev/tty || true
+    read -r -p "Czy chcesz kontynuować instalację mimo to? (t/N): " FORCE_CONT </dev/tty || true
     if [[ ! "$FORCE_CONT" =~ ^[tTyY]$ ]]; then
-        echo "Przerwano."
+        echo "Przerwano instalację."
         exit 1
     fi
     SITE_ID=""
@@ -160,6 +166,11 @@ prompt COOLDOWN_HOURS "Czas cooldownu po restarcie (w godzinach)" "3"
 echo -e "\n--- [3/4] Pobieranie szablonu i tworzenie kontenera ---"
 pveam update >/dev/null 2>&1 || true
 TEMPLATE=$(pveam available -section system | grep "debian-12-standard" | awk '{print $2}' | sort -V | tail -n 1)
+
+if [ -z "$TEMPLATE" ]; then
+    echo "[-] Nie znaleziono szablonu Debiana 12 w pveam."
+    exit 1
+fi
 
 TEMPLATE_STORAGE="local"
 if ! pvesm status -storage "$TEMPLATE_STORAGE" &>/dev/null; then
@@ -197,7 +208,7 @@ done
 echo ">> Instalacja pakietów w LXC (python3, ping, curl)..."
 pct exec "$CT_ID" -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 iputils-ping curl ca-certificates" >/dev/null
 
-echo -e "\n--- [4/4] Konfiguracja aplikacji i start serwisu ---"
+echo -e "\n--- [4/4] Bezpieczne wgrywanie konfiguracji i start serwisu ---"
 pct exec "$CT_ID" -- mkdir -p /opt/omada-watchdog
 
 TMP_CONF=$(mktemp)
@@ -305,7 +316,7 @@ def get_token():
 def reboot_router():
     log(f"Inicjalizacja restartu routera {CONFIG['target_mac']}...")
     token = get_token()
-    headers = {"AccessToken": token, "Content-Type": "application/json"}
+    headers = {"Authorization": f"AccessToken={token}", "Content-Type": "application/json"}
     site_id = CONFIG.get("site_id")
     if not site_id:
         sites_url = f"{CONFIG['omada_url']}/openapi/v1/{CONFIG['omadac_id']}/sites?page=1&pageSize=100"
