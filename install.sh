@@ -2,10 +2,10 @@
 # ==============================================================================
 # Omada ER605 Watchdog LXC Installer for Proxmox VE
 # Style: Proxmox Community Helper-Scripts
+# Bezpieczne przekazywanie poświadczeń przez sys.argv + JSON + pct push
 # ==============================================================================
 set -euo pipefail
 
-# Kolory konsoli
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -14,9 +14,9 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# Sprawdzenie środowiska Proxmox VE
+# Weryfikacja środowiska hosta Proxmox VE
 if ! command -v pveversion >/dev/null 2>&1; then
-    echo -e "${RED}Błąd: Ten skrypt musi być uruchomiony bezpośrednio w powłoce Proxmox VE!${NC}"
+    echo -e "${RED}Błąd: Ten instalator musi być uruchomiony bezpośrednio w powłoce Proxmox VE (PVE Shell)!${NC}"
     exit 1
 fi
 
@@ -35,50 +35,50 @@ cat << "EOF"
   \___/|_| |_| |_|\__,_|\__,_|\__,_|    \/  \__,_|\__\___|_| |_|\__,_|\___/ \__, |
                                                                              |___/  
 EOF
-echo -e "${NC}${GREEN}Autoinstalator kontenera LXC z monitorem łącza i Web UI dla ER605${NC}\n"
+echo -e "${NC}${GREEN}Autoinstalator LXC dla Omada ER605 Watchdog (PVE 7 / 8 / 9)${NC}\n"
 
-# Funkcja bezpiecznego czytania z /dev/tty (kluczowa dla curl | bash)
+# Bezpieczne odczytywanie wejścia z /dev/tty (wymóg dla potoków curl | bash)
 prompt() {
     local var_name="$1"
     local prompt_text="$2"
     local default_val="$3"
-    local input
-    
+    local input=""
+
     echo -ne "${BOLD}${prompt_text}${NC} [${YELLOW}${default_val}${NC}]: "
     read -r input </dev/tty || true
     if [ -z "$input" ]; then
-        eval "$var_name=\"$default_val\""
+        printf -v "$var_name" "%s" "$default_val"
     else
-        eval "$var_name=\"$input\""
+        printf -v "$var_name" "%s" "$input"
     fi
 }
 
 prompt_secret() {
     local var_name="$1"
     local prompt_text="$2"
-    local input
-    
+    local input=""
+
     while true; do
         echo -ne "${BOLD}${prompt_text}${NC}: "
         read -r -s input </dev/tty || true
         echo ""
         if [ -n "$input" ]; then
-            eval "$var_name=\"$input\""
+            printf -v "$var_name" "%s" "$input"
             break
         fi
-        echo -e "${RED}To pole jest wymagane!${NC}"
+        echo -e "${RED}To pole nie może być puste!${NC}"
     done
 }
 
-echo -e "${BLUE}--- [1/3] Konfiguracja kontenera LXC ---${NC}"
+echo -e "${BLUE}--- [1/3] Parametry kontenera LXC ---${NC}"
 NEXT_ID=$(pvesh get /cluster/nextid)
-prompt CTID "Numer ID kontenera" "$NEXT_ID"
+prompt CTID "Numer ID nowego kontenera" "$NEXT_ID"
 prompt HOSTNAME "Nazwa hosta" "omada-watchdog"
-prompt RAM "Pamięć RAM (MB)" "512"
-prompt DISK "Rozmiar dysku (GB)" "2"
+prompt RAM "Pamięć RAM w MB" "512"
+prompt DISK "Rozmiar dysku w GB" "2"
 prompt WEB_PORT "Port Web UI" "8080"
 
-# Wykrywanie dostępnego magazynu danych
+# Wykrycie pamięci masowej
 STORAGE="local-lvm"
 if ! pvesm status -storage "$STORAGE" &>/dev/null; then
     STORAGE="local-zfs"
@@ -95,15 +95,16 @@ prompt_secret CLIENT_SECRET "Omada Client Secret"
 
 while true; do
     echo -ne "${BOLD}Adres MAC routera ER605 (np. AA-BB-CC-DD-EE-FF)${NC}: "
-    read -r ER605_MAC </dev/tty || true
-    ER605_MAC=$(echo "$ER605_MAC" | tr '[:lower:]' '[:upper:]' | tr ':' '-')
-    if [[ "$ER605_MAC" =~ ^([0-9A-F]{2}-){5}[0-9A-F]{2}$ ]]; then
+    read -r RAW_MAC </dev/tty || true
+    CLEAN_MAC=$(echo "$RAW_MAC" | tr '[:lower:]' '[:upper:]' | tr ':' '-')
+    if [[ "$CLEAN_MAC" =~ ^([0-9A-F]{2}-){5}[0-9A-F]{2}$ ]]; then
+        ER605_MAC="$CLEAN_MAC"
         break
     fi
-    echo -e "${RED}Nieprawidłowy format MAC. Użyj formatu XX-XX-XX-XX-XX-XX lub XX:XX:XX:XX:XX:XX${NC}"
+    echo -e "${RED}Nieprawidłowy format. Podaj MAC w formacie XX-XX-XX-XX-XX-XX lub XX:XX:XX:XX:XX:XX${NC}"
 done
 
-prompt COOLDOWN "Cooldown restartu (godziny)" "3"
+prompt COOLDOWN "Czas cooldownu po restarcie (w godzinach)" "3"
 
 echo -e "\n${BLUE}--- [3/3] Przygotowanie i tworzenie kontenera ---${NC}"
 
@@ -116,7 +117,7 @@ if [ -z "$TEMPLATE" ]; then
     TEMPLATE=$(pveam available -section system | awk '{print $2}' | grep -E 'debian' | sort -V | tail -n 1)
 fi
 
-echo -e "${YELLOW}>> Pobieranie szablonu $TEMPLATE do storage 'local'...${NC}"
+echo -e "${YELLOW}>> Pobieranie szablonu OS (${TEMPLATE})...${NC}"
 pveam download local "$TEMPLATE" >/dev/null 2>&1 || true
 
 echo -e "${YELLOW}>> Tworzenie kontenera LXC ($CTID)...${NC}"
@@ -132,33 +133,49 @@ pct create "$CTID" "local:vztmpl/$TEMPLATE" \
     --onboot 1 \
     --start 1
 
-echo -e "${YELLOW}>> Oczekiwanie na uruchomienie sieci w LXC...${NC}"
-for i in {1..15}; do
+echo -e "${YELLOW}>> Oczekiwanie na inicjalizację sieci w kontenerze...${NC}"
+for i in {1..20}; do
     if pct exec "$CTID" -- ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1; then
         break
     fi
     sleep 1
 done
 
-echo -e "${YELLOW}>> Instalacja pakietów wewnątrz LXC (Python3, Ping, Curl, jq)...${NC}"
-pct exec "$CTID" -- bash -c "apt-get update -qq && apt-get install -y -qq python3 iputils-ping curl jq ca-certificates" >/dev/null
-
-echo -e "${YELLOW}>> Bezpieczny zapis poświadczeń do /etc/omada-watchdog.env...${NC}"
+echo -e "${YELLOW}>> Instalacja pakietów w LXC (python3, iputils-ping, curl, ca-certificates)...${NC}"
+pct exec "$CTID" -- bash -c "apt-get update -qq && apt-get install -y -qq python3 iputils-ping curl ca-certificates" >/dev/null
 pct exec "$CTID" -- mkdir -p /opt/omada-watchdog /etc
 
-# Plik środowiskowy zabezpieczony chmod 600
-pct exec "$CTID" -- bash -c "cat << 'ENVEOF' > /etc/omada-watchdog.env
-OMADA_URL='${OMADA_URL}'
-CLIENT_ID='${CLIENT_ID}'
-CLIENT_SECRET='${CLIENT_SECRET}'
-ER605_MAC='${ER605_MAC}'
-COOLDOWN_HOURS='${COOLDOWN}'
-PORT='${WEB_PORT}'
-ENVEOF
-chmod 600 /etc/omada-watchdog.env"
+# Bezpieczne tworzenie pliku JSON na hoście za pomocą Pythona (przekazanie przez sys.argv)
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+TMP_CONFIG="${TMP_DIR}/config.json"
+touch "$TMP_CONFIG"
+chmod 600 "$TMP_CONFIG"
 
-echo -e "${YELLOW}>> Wdrażanie aplikacji mikro-serwisu Pythona...${NC}"
-pct exec "$CTID" -- bash -c "cat << 'PYEOF' > /opt/omada-watchdog/app.py
+python3 - "$TMP_CONFIG" "$OMADA_URL" "$CLIENT_ID" "$CLIENT_SECRET" "$ER605_MAC" "$COOLDOWN" "$WEB_PORT" << 'PYGEN'
+import sys
+import json
+
+target_file = sys.argv[1]
+data = {
+    "OMADA_URL": sys.argv[2].rstrip('/'),
+    "CLIENT_ID": sys.argv[3],
+    "CLIENT_SECRET": sys.argv[4],
+    "ER605_MAC": sys.argv[5],
+    "COOLDOWN_HOURS": int(sys.argv[6]),
+    "PORT": int(sys.argv[7])
+}
+
+with open(target_file, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+PYGEN
+
+echo -e "${YELLOW}>> Wgrywanie pliku konfiguracyjnego przez pct push...${NC}"
+pct push "$CTID" "$TMP_CONFIG" /etc/omada-watchdog.json --perms 0600
+
+# Przygotowanie statycznego kodu aplikacji w pliku tymczasowym
+TMP_APP="${TMP_DIR}/app.py"
+cat << 'PYEOF' > "$TMP_APP"
 #!/usr/bin/env python3
 import http.server
 import json
@@ -171,12 +188,20 @@ import urllib.request
 import ssl
 from datetime import datetime
 
-OMADA_URL = os.environ.get('OMADA_URL', 'https://192.168.0.4').rstrip('/')
-CLIENT_ID = os.environ.get('CLIENT_ID', '')
-CLIENT_SECRET = os.environ.get('CLIENT_SECRET', '')
-ER605_MAC = os.environ.get('ER605_MAC', '')
-COOLDOWN_HOURS = int(os.environ.get('COOLDOWN_HOURS', '3'))
-PORT = int(os.environ.get('PORT', '8080'))
+CONFIG_PATH = '/etc/omada-watchdog.json'
+try:
+    with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+        config = json.load(f)
+except Exception as e:
+    print(f'KRYTYCZNY BŁĄD: Nie można wczytać pliku {CONFIG_PATH}: {e}')
+    raise SystemExit(1)
+
+OMADA_URL = config.get('OMADA_URL', '').rstrip('/')
+CLIENT_ID = config.get('CLIENT_ID', '')
+CLIENT_SECRET = config.get('CLIENT_SECRET', '')
+ER605_MAC = config.get('ER605_MAC', '')
+COOLDOWN_HOURS = int(config.get('COOLDOWN_HOURS', 3))
+PORT = int(config.get('PORT', 8080))
 
 CHECK_IPS = ['1.1.1.1', '8.8.8.8', '9.9.9.9']
 
@@ -213,19 +238,17 @@ def check_internet():
     return False
 
 def get_omada_token(ctx):
-    # 1. Pobranie omadacId
     req = urllib.request.Request(f'{OMADA_URL}/api/info')
     with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
         info_data = json.loads(r.read().decode())
     omadac_id = info_data.get('result', {}).get('omadacId')
     if not omadac_id:
-        raise Exception('Nie udało się pobrać omadacId z kontrolera.')
+        raise Exception('Brak omadacId w odpowiedzi kontrolera.')
 
-    # 2. Pobranie tokena
-    auth_body = json.dumps({'omadacId': omadac_id, 'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET}).encode()
+    auth_payload = json.dumps({'omadacId': omadac_id, 'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET}).encode('utf-8')
     auth_req = urllib.request.Request(
         f'{OMADA_URL}/openapi/authorize/token?grant_type=client_credentials',
-        data=auth_body,
+        data=auth_payload,
         headers={'Content-Type': 'application/json'}
     )
     with urllib.request.urlopen(auth_req, context=ctx, timeout=10) as r:
@@ -233,15 +256,14 @@ def get_omada_token(ctx):
     
     token = token_data.get('result', {}).get('accessToken')
     if not token:
-        err = token_data.get('msg', 'Brak tokena')
-        raise Exception(f'Błąd logowania API: {err}')
+        err = token_data.get('msg', 'Brak accessToken w odpowiedzi')
+        raise Exception(f'Błąd logowania Open API: {err}')
     return omadac_id, token
 
 def reboot_er605():
     ctx = ssl._create_unverified_context()
     omadac_id, token = get_omada_token(ctx)
 
-    # Pobranie siteId
     site_req = urllib.request.Request(
         f'{OMADA_URL}/openapi/v1/{omadac_id}/sites?pageSize=1',
         headers={'Authorization': f'AccessToken={token}'}
@@ -251,8 +273,7 @@ def reboot_er605():
     sites = site_data.get('result', {}).get('data', [])
     site_id = sites[0]['siteId'] if sites else 'Default'
 
-    # Wysłanie komendy restartu
-    body = json.dumps({'deviceMacs': [ER605_MAC]}).encode()
+    body = json.dumps({'deviceMacs': [ER605_MAC]}).encode('utf-8')
     reboot_req = urllib.request.Request(
         f'{OMADA_URL}/openapi/v1/{omadac_id}/sites/{site_id}/cmd/devices/reboot',
         data=body,
@@ -262,7 +283,7 @@ def reboot_er605():
         res = json.loads(r.read().decode())
     
     if res.get('errorCode') != 0:
-        raise Exception(res.get('msg', f'Kod błędu: {res.get(\"errorCode\")}'))
+        raise Exception(res.get('msg', f'Błąd API: {res.get(\"errorCode\")}'))
 
 def run_watchdog(manual=False):
     prefix = ' (test ręczny)' if manual else ''
@@ -276,7 +297,7 @@ def run_watchdog(manual=False):
         return
 
     state['status'] = 'OFFLINE'
-    log('Brak internetu po 3 próbach (OFFLINE)!')
+    log('KRYTYCZNE: Brak internetu po 3 próbach (OFFLINE)!')
 
     now = time.time()
     cooldown_sec = COOLDOWN_HOURS * 3600
@@ -284,7 +305,7 @@ def run_watchdog(manual=False):
 
     if elapsed < cooldown_sec and not manual:
         rem = int((cooldown_sec - elapsed) / 60)
-        log(f'Cooldown aktywny. Restart wstrzymany na jeszcze {rem} min.')
+        log(f'Cooldown aktywny. Restart routera wstrzymany na jeszcze {rem} min.')
         return
 
     try:
@@ -292,7 +313,7 @@ def run_watchdog(manual=False):
         reboot_er605()
         state['last_reboot_ts'] = now
         state['last_reboot'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        log('SUKCES: Polecenie restartu ER605 zostało zaakceptowane przez kontroler.')
+        log('SUKCES: Router ER605 został pomyślnie zrestartowany przez API!')
     except Exception as e:
         log(f'BŁĄD procedury restartu: {e}')
 
@@ -300,7 +321,7 @@ def scheduler_thread():
     time.sleep(5)
     while True:
         run_watchdog(manual=False)
-        time.sleep(1800)  # 30 minut
+        time.sleep(1800)
 
 HTML_PAGE = '''<!DOCTYPE html>
 <html lang="pl">
@@ -324,7 +345,7 @@ HTML_PAGE = '''<!DOCTYPE html>
   .stat span {{ display: block; font-size: 0.75rem; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; }}
   .stat b {{ font-size: 0.95rem; font-weight: 600; }}
   .actions {{ display: flex; gap: 10px; margin-bottom: 20px; }}
-  button {{ border: 0; padding: 9px 16px; border-radius: 6px; font-weight: 600; font-size: 0.85rem; cursor: pointer; transition: opacity 0.2s; }}
+  button {{ border: 0; padding: 9px 16px; border-radius: 6px; font-weight: 600; font-size: 0.85rem; cursor: pointer; }}
   button:hover {{ opacity: 0.9; }}
   .btn-primary {{ background: #2563eb; color: #fff; }}
   .btn-danger {{ background: #dc2626; color: #fff; }}
@@ -364,7 +385,7 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'text/html; charset=utf-8')
         self.end_headers()
-        self.wfile.write(page.encode())
+        self.wfile.write(page.encode('utf-8'))
 
     def do_POST(self):
         if self.path == '/check':
@@ -380,10 +401,13 @@ if __name__ == '__main__':
     with socketserver.TCPServer(('', PORT), WebHandler) as server:
         server.serve_forever()
 PYEOF
-chmod +x /opt/omada-watchdog/app.py"
 
-echo -e "${YELLOW}>> Konfiguracja i uruchomienie usługi systemd...${NC}"
-pct exec "$CTID" -- bash -c "cat << 'SVCEOF' > /etc/systemd/system/omada-watchdog.service
+echo -e "${YELLOW}>> Wgrywanie kodu aplikacji do /opt/omada-watchdog/app.py...${NC}"
+pct push "$CTID" "$TMP_APP" /opt/omada-watchdog/app.py --perms 0755
+
+# Przygotowanie i wgranie pliku usługi systemd
+TMP_SVC="${TMP_DIR}/omada-watchdog.service"
+cat << 'SVCEOF' > "$TMP_SVC"
 [Unit]
 Description=Omada ER605 Watchdog Service
 After=network.target
@@ -391,7 +415,6 @@ After=network.target
 [Service]
 Type=simple
 User=root
-EnvironmentFile=/etc/omada-watchdog.env
 WorkingDirectory=/opt/omada-watchdog
 ExecStart=/usr/bin/python3 /opt/omada-watchdog/app.py
 Restart=always
@@ -400,11 +423,14 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 SVCEOF
-systemctl daemon-reload
-systemctl enable --now omada-watchdog.service
-"
 
-# Odczytanie przydzielonego adresu IP
+pct push "$CTID" "$TMP_SVC" /etc/systemd/system/omada-watchdog.service --perms 0644
+
+echo -e "${YELLOW}>> Uruchamianie usługi w LXC...${NC}"
+pct exec "$CTID" -- systemctl daemon-reload
+pct exec "$CTID" -- systemctl enable --now omada-watchdog.service
+
+# Pobranie adresu IP kontenera
 LXC_IP=""
 for i in {1..10}; do
     LXC_IP=$(pct exec "$CTID" -- ip -4 addr show eth0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1 || true)
@@ -419,5 +445,5 @@ echo -e "${GREEN}${BOLD}  INSTALACJA ZAKOŃCZONA SUKCESEM!${NC}"
 echo -e "${BOLD}  Kontener ID:${NC}       ${CYAN}${CTID}${NC}"
 echo -e "${BOLD}  Adres IP:${NC}           ${CYAN}${LXC_IP:-DHCP}${NC}"
 echo -e "${BOLD}  Panel Web UI:${NC}       ${YELLOW}http://${LXC_IP:-IP_KONTENERA}:${WEB_PORT}${NC}"
-echo -e "${BOLD}  Plik konfiguracji:${NC}  ${CYAN}/etc/omada-watchdog.env${NC} (wewnątrz LXC)"
+echo -e "${BOLD}  Plik konfiguracji:${NC}  ${CYAN}/etc/omada-watchdog.json${NC} (wewnątrz LXC, uprawnienia 0600)"
 echo -e "${GREEN}${BOLD}================================================================${NC}\n"
