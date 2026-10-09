@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -e
-REPO_USER="devv0lf" # Zmień na swój login GitHub
+REPO_USER="devv0lf"
 REPO_NAME="omada-watchdog"
 BRANCH="main"
 
