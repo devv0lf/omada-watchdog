@@ -75,4 +75,4 @@ Narzędzie w regularnych interwałach monitoruje łączność ze światem zewnę
 Zaloguj się przez SSH do hosta **Proxmox VE** lub otwórz konsolę `Shell` w panelu PVE i uruchom:
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/TWOJ_USER/omada-watchdog/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/devv0lf/omada-watchdog/main/install.sh)"
