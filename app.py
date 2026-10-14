@@ -23,6 +23,7 @@ state = {
     "last_reboot": None,
     "last_latency_ms": None,
     "consecutive_failures": 0,
+    "next_check_in_minutes": CONFIG.get("check_interval_minutes", 30),
     "history_24h": [],
     "reboot_history": [],
     "logs": []
@@ -109,7 +110,6 @@ def reboot_router(trigger="MANUAL_WEB_UI"):
             sites = sites_res.get("result", {}).get("data", [])
             if sites:
                 site_id = sites[0].get("siteId")
-
         reboot_url = f"{CONFIG['omada_url']}/openapi/v1/{CONFIG['omadac_id']}/sites/{site_id}/devices/{mac}/reboot"
         req_reboot = urllib.request.Request(reboot_url, data=b"{}", headers=headers)
         with urllib.request.urlopen(req_reboot, context=ctx, timeout=10) as r:
@@ -141,7 +141,6 @@ def run_watchdog(manual=False):
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
     state["last_check"] = now_str
     state["last_latency_ms"] = lat
-
     cutoff = (now - timedelta(hours=24)).isoformat()
     state["history_24h"] = [p for p in state.get("history_24h", []) if p.get("ts", "") > cutoff]
     state["history_24h"].append({
@@ -151,16 +150,22 @@ def run_watchdog(manual=False):
         "ms": lat if online else 0
     })
 
+    interval_online = CONFIG.get("check_interval_minutes", 30)
+    interval_offline = CONFIG.get("retry_interval_minutes", 10)
+
     if online:
         state["last_status"] = "ONLINE"
         state["consecutive_failures"] = 0
-        log(f"Status: ONLINE ({lat} ms){prefix}")
+        state["next_check_in_minutes"] = interval_online
+        log(f"Status: ONLINE ({lat} ms){prefix}. Kolejne sprawdzenie za {interval_online} min.")
     else:
         state["last_status"] = "OFFLINE"
         state["consecutive_failures"] += 1
-        log(f"ALERT: Brak WAN! Próba {state['consecutive_failures']}/{CONFIG.get('max_retries', 3)}")
+        state["next_check_in_minutes"] = interval_offline
+        max_retries = CONFIG.get("max_retries", 3)
+        log(f"ALERT: Brak WAN! Próba {state['consecutive_failures']}/{max_retries}. Kolejne sprawdzenie za {interval_offline} min.")
         
-        if state["consecutive_failures"] >= CONFIG.get("max_retries", 3):
+        if state["consecutive_failures"] >= max_retries:
             in_cooldown = False
             if state.get("last_reboot"):
                 try:
@@ -175,18 +180,23 @@ def run_watchdog(manual=False):
                 reboot_router(trigger="AUTO_WATCHDOG_FAIL")
                 state["consecutive_failures"] = 0
     save_state()
+    return online
 
 def watchdog_loop():
+    interval_online = CONFIG.get("check_interval_minutes", 30) * 60
+    interval_offline = CONFIG.get("retry_interval_minutes", 10) * 60
     while True:
         try:
-            run_watchdog(manual=False)
+            online = run_watchdog(manual=False)
+            sleep_sec = interval_online if online else interval_offline
         except Exception as e:
             log(f"Pętla błędu: {e}")
-        time.sleep(CONFIG.get("check_interval_minutes", 30) * 60)
+            sleep_sec = interval_offline
+        time.sleep(sleep_sec)
 
 class RequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/api/status":
+        if self.path == "/api/status" or self.path == "/api/state":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -196,7 +206,6 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
-
         cooldown_str = "BRAK"
         if state.get("last_reboot"):
             try:
@@ -209,10 +218,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     cooldown_str = "WYGASŁY"
             except Exception:
                 pass
-
         history_json = json.dumps(state.get("history_24h", []))
         logs_html = "\n".join(reversed(state.get("logs", [])))
-
         reboot_rows = ""
         reboots = state.get("reboot_history", [])
         if not reboots:
@@ -227,7 +234,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                     <td>{r.get('code')}</td>
                     <td style='color:#cbd5e1;word-break:break-all;'>{r.get('details')}</td>
                 </tr>"""
-
         html = f"""<!DOCTYPE html>
 <html lang="pl">
 <head>
@@ -312,7 +318,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         }}
         .grid {{
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
             gap: 16px;
             margin-bottom: 20px;
         }}
@@ -416,6 +422,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 <div class="stat">
                     <div class="stat-label">LAST_CHECK</div>
                     <div class="stat-value">{state.get('last_check') or 'N/A'}</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">NEXT_CHECK_IN</div>
+                    <div class="stat-value">~{state.get('next_check_in_minutes', 30)} min</div>
                 </div>
                 <div class="stat">
                     <div class="stat-label">COOLDOWN_STATE</div>
