@@ -121,7 +121,7 @@ def get_omada_token(force_refresh=False):
             result = json.loads(response.read().decode("utf-8"))
 
         if result.get("errorCode", 0) != 0 or "result" not in result:
-            raise RuntimeError(f"Omada token error: {result}")
+            raise RuntimeError(f"Błąd autoryzacji Omada API: {result}")
 
         token = result["result"]["accessToken"]
         expires_in = int(result["result"].get("expiresIn", 7200))
@@ -138,7 +138,7 @@ def omada_api_request(method, endpoint, body=None):
         raise ValueError("Nieprawidłowy endpoint")
 
     if endpoint.startswith("http://") or endpoint.startswith("https://"):
-        raise ValueError("Dozwolone są tylko ścieżki API, nie pełne adresy URL")
+        raise ValueError("Dozwolone są tylko ścieżki API")
 
     base_url = CONFIG["omada_url"].rstrip("/")
     if endpoint.startswith("/openapi/"):
@@ -196,14 +196,20 @@ def safe_ping(target, count=1, timeout=2):
     try:
         ipaddress.ip_address(str(target))
     except ValueError:
-        return {"target": str(target), "ok": False, "error": "Nieprawidłowy adres IP"}
+        return {"target": str(target), "ok": False, "error": "Niepoprawny IP"}
     try:
         result = subprocess.run(
             ["ping", "-n", "-c", str(count), "-W", str(timeout), str(target)],
             capture_output=True, text=True, timeout=count * timeout + 2
         )
-        output = (result.stdout or result.stderr or "")[-1200:]
-        return {"target": target, "ok": result.returncode == 0, "output": output}
+        latency = None
+        for line in (result.stdout or "").splitlines():
+            if "min/avg/max" in line or "rtt min/avg/max" in line:
+                try:
+                    latency = float(line.split("=")[1].strip().split("/")[1])
+                except Exception:
+                    pass
+        return {"target": target, "ok": result.returncode == 0, "latency_ms": latency}
     except Exception as exc:
         return {"target": target, "ok": False, "error": str(exc)}
 
@@ -232,9 +238,11 @@ def local_diagnostics():
             ["getent", "ahostsv4", "example.com"],
             capture_output=True, text=True, timeout=4
         )
+        lines = [l.strip() for l in (dns.stdout or "").splitlines() if l.strip()]
+        resolved_ip = lines[0].split()[0] if lines else None
         result["dns"] = {
-            "ok": dns.returncode == 0,
-            "output": (dns.stdout or dns.stderr or "")[:500]
+            "ok": dns.returncode == 0 and resolved_ip is not None,
+            "resolved_ip": resolved_ip
         }
     except Exception as exc:
         result["dns"] = {"ok": False, "error": str(exc)}
@@ -242,26 +250,47 @@ def local_diagnostics():
 
 
 def diagnose_wan_state():
+    mac_norm = str(CONFIG.get("target_mac", "")).replace(":", "-").upper().strip()
     diag = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "device_mac": CONFIG.get("target_mac"),
+        "device_mac": mac_norm,
         "omada_http_code": None,
         "omada_error": None,
-        "omada_device": None,
+        "er605_info": None,
         "lxc": local_diagnostics()
     }
-    mac = str(CONFIG.get("target_mac", "")).replace(":", "-").upper()
+    
+    # Pobranie listy urządzeń i wyszukanie ER605 po MAC (omija błąd -1600)
     try:
-        response, http_code = omada_api_request("GET", f"devices/{mac}")
+        response, http_code = omada_api_request("GET", "devices?page=1&pageSize=50")
         diag["omada_http_code"] = http_code
-        diag["omada_device"] = response
-        if isinstance(response, dict):
-            error_code = response.get("errorCode")
-            if error_code not in (None, 0):
-                diag["omada_error"] = {
-                    "code": error_code,
-                    "description": OMADA_ERROR_CODES.get(error_code, "Nieznany kod Omada")
+        if http_code == 200 and isinstance(response, dict) and response.get("errorCode", 0) == 0:
+            dev_list = response.get("result", {}).get("data", []) or []
+            matched = None
+            for d in dev_list:
+                d_mac = str(d.get("mac", "")).replace(":", "-").upper().strip()
+                if d_mac == mac_norm:
+                    matched = d
+                    break
+            
+            if matched:
+                diag["er605_info"] = {
+                    "name": matched.get("name", "BRAMA"),
+                    "model": matched.get("model", "ER605"),
+                    "status": matched.get("statusCategory", matched.get("status", 1)),
+                    "uptime": matched.get("uptime", 0),
+                    "ip": matched.get("ip", "BRAK"),
+                    "firmware": matched.get("firmwareVersion", ""),
+                    "raw": matched
                 }
+            else:
+                diag["omada_error"] = f"Router {mac_norm} nie został znaleziony na liście urządzeń."
+        else:
+            err_code = response.get("errorCode") if isinstance(response, dict) else None
+            diag["omada_error"] = {
+                "code": err_code,
+                "desc": OMADA_ERROR_CODES.get(err_code, "Błąd pobierania urządzeń")
+            }
     except Exception as exc:
         diag["omada_error"] = str(exc)
 
@@ -304,7 +333,7 @@ def perform_reboot(trigger="MANUAL"):
             entry["status"] = "SUCCESS"
             with STATE_LOCK:
                 state["last_reboot"] = entry["timestamp"]
-            add_log("Komenda restartu została wysłana pomyślnie do kontrolera Omada!")
+            add_log("Komenda restartu wysłana pomyślnie do kontrolera Omada!")
         else:
             add_log(f"Błąd restartu: HTTP {http_code}: {json.dumps(response, ensure_ascii=False)[:1000]}")
     except Exception as exc:
@@ -322,15 +351,7 @@ def check_internet():
     for target in CONFIG.get("ping_targets", ["1.1.1.1", "8.8.8.8"]):
         result = safe_ping(target, count=1, timeout=2)
         if result["ok"]:
-            latency = None
-            output = result.get("output", "")
-            for line in output.splitlines():
-                if "min/avg/max" in line or "rtt min/avg/max" in line:
-                    try:
-                        latency = float(line.split("=")[1].strip().split("/")[1])
-                    except (IndexError, ValueError):
-                        pass
-            return True, latency
+            return True, result.get("latency_ms", 20.0)
     return False, None
 
 
@@ -373,13 +394,9 @@ def watchdog_loop():
         try:
             diag = diagnose_wan_state()
             lxc = diag.get("lxc", {})
-            add_log(
-                "Diagnostyka awarii: "
-                f"Omada HTTP={diag.get('omada_http_code')}, "
-                f"Brama LXC={lxc.get('lxc_gateway', 'brak')}, "
-                f"Ping bramy={((lxc.get('gateway_ping') or {}).get('ok'))}, "
-                f"DNS={((lxc.get('dns') or {}).get('ok'))}"
-            )
+            gw_ok = (lxc.get("gateway_ping") or {}).get("ok")
+            dns_ok = (lxc.get("dns") or {}).get("ok")
+            add_log(f"Diagnostyka awarii: Omada HTTP={diag.get('omada_http_code')}, Brama LAN Ping={gw_ok}, DNS={dns_ok}")
         except Exception as exc:
             add_log(f"Błąd diagnostyki awarii: {exc}")
 
@@ -397,50 +414,53 @@ HTML_PAGE = r"""<!doctype html>
 <html lang="pl">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>Omada ER605 Watchdog // Cyber Matrix</title>
   <style>
     :root {
       --bg: #050808;
-      --card: rgba(10,20,15,.92);
+      --card: rgba(10,20,15,0.94);
       --green: #00ff66;
       --dim: #007a39;
-      --red: #ff4355;
+      --red: #ff3344;
       --line: #124b2b;
       --text-muted: #83bd98;
     }
     * { box-sizing: border-box; }
     body {
-      margin: 0; padding: 18px;
+      margin: 0; padding: 12px;
       background: var(--bg); color: var(--green);
-      font: 14px Consolas, "Courier New", monospace;
+      font: 13px Consolas, "Courier New", monospace;
+      -webkit-font-smoothing: antialiased;
     }
     #glow {
       position: fixed; inset: 0; pointer-events: none; z-index: -1;
-      background: radial-gradient(circle at 50% 30%, rgba(0,255,102,.08), transparent 55%);
+      background: radial-gradient(circle at 50% 25%, rgba(0,255,102,0.08), transparent 55%);
     }
     main { max-width: 1250px; margin: auto; }
     .header, .card {
       border: 1px solid var(--line); background: var(--card);
-      padding: 15px; margin-bottom: 14px; box-shadow: 0 0 12px #002511;
+      padding: 14px; margin-bottom: 12px; box-shadow: 0 0 10px #002511;
     }
     .header {
       display: flex; justify-content: space-between; gap: 12px;
       align-items: center; flex-wrap: wrap;
     }
-    h1 { font-size: 20px; margin: 0 0 5px; }
-    h2 { font-size: 14px; color: #8affb5; margin: 0 0 12px; }
+    h1 { font-size: 18px; margin: 0 0 4px; }
+    h2 { font-size: 13px; color: #8affb5; margin: 0 0 10px; }
     .grid {
-      display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-      gap: 12px;
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
     }
-    .metric { font-size: 24px; font-weight: bold; }
-    .muted { color: var(--text-muted); }
+    .metric { font-size: 22px; font-weight: bold; }
+    .muted { color: var(--text-muted); font-size: 12px; margin-top: 4px; }
     .online { color: var(--green); text-shadow: 0 0 8px var(--green); }
     .offline { color: var(--red); text-shadow: 0 0 8px var(--red); }
+    
     button, select, input, textarea {
       font: inherit; color: var(--green); background: #00170a;
       border: 1px solid var(--dim); padding: 8px 12px;
+      border-radius: 2px;
     }
     button { cursor: pointer; transition: all 0.2s; font-weight: bold; }
     button:hover { background: #06451e; box-shadow: 0 0 8px var(--green); }
@@ -448,24 +468,52 @@ HTML_PAGE = r"""<!doctype html>
     .btn-diag:hover { background: #003344; box-shadow: 0 0 8px #00ddff; }
     .danger { border-color: var(--red); color: var(--red); }
     .danger:hover { background: #550011; box-shadow: 0 0 8px var(--red); }
-    textarea { width: 100%; min-height: 70px; margin-top: 8px; }
-    input { min-width: 280px; flex: 1; }
-    select { min-width: 280px; }
+    
+    .actions-row { display: flex; gap: 8px; flex-wrap: wrap; }
     .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; align-items: center; }
+    input, select { flex: 1; min-width: 200px; }
+    textarea { width: 100%; min-height: 60px; margin-top: 6px; }
+    
     pre {
       white-space: pre-wrap; word-break: break-word; background: #020803;
-      padding: 10px; max-height: 350px; overflow: auto; border: 1px solid var(--line);
+      padding: 8px; max-height: 250px; overflow: auto; border: 1px solid var(--line);
+      font-size: 11px;
     }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { border: 1px solid var(--line); padding: 8px; text-align: left; vertical-align: top; }
-    th { background: rgba(0, 255, 102, 0.08); }
-    small { color: #9bdab0; }
-    .scroll { overflow: auto; max-height: 400px; }
-    .logs { max-height: 220px; overflow: auto; line-height: 1.55; }
-    .diag { max-width: 500px; word-break: break-word; font-size: 12px; }
+    .logs { max-height: 200px; overflow-y: auto; line-height: 1.5; font-size: 12px; }
+    
+    /* Diagnostyka i audyt w formie elastycznych kafelków/kart */
+    .diag-card {
+      border: 1px solid var(--line); background: #020e06;
+      padding: 10px; margin-bottom: 8px; border-radius: 3px;
+    }
+    .diag-head {
+      display: flex; justify-content: space-between; align-items: center;
+      border-bottom: 1px dashed var(--line); padding-bottom: 6px; margin-bottom: 8px;
+      font-size: 12px; flex-wrap: wrap; gap: 6px;
+    }
+    .diag-badges { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+    .badge {
+      display: inline-block; padding: 3px 6px; border-radius: 2px; font-size: 11px;
+      border: 1px solid var(--dim); background: #001f0c;
+    }
+    .badge-ok { border-color: var(--green); color: var(--green); }
+    .badge-fail { border-color: var(--red); color: var(--red); }
+    .badge-info { border-color: #00ddff; color: #00ddff; }
+
     .preset-desc {
       background: #001407; border: 1px dashed var(--dim);
       padding: 8px; margin: 6px 0; font-size: 12px; color: #afffd0;
+    }
+
+    /* RWD dla urządzeń mobilnych */
+    @media (max-width: 768px) {
+      body { padding: 8px; }
+      .header { flex-direction: column; align-items: stretch; }
+      .actions-row { flex-direction: column; }
+      .actions-row button { width: 100%; min-height: 44px; font-size: 14px; }
+      .grid { grid-template-columns: 1fr; }
+      .row { flex-direction: column; align-items: stretch; }
+      input, select, button { width: 100%; min-height: 40px; }
     }
   </style>
 </head>
@@ -475,9 +523,9 @@ HTML_PAGE = r"""<!doctype html>
   <div class="header">
     <div>
       <h1>OMADA ER605 WATCHDOG // SYSTEM CYBERNETYCZNY</h1>
-      <small>Węzeł: LXC 107 | Cel: ER605 BRAMA (__MAC__) | Kontroler: Omada SDN</small>
+      <small class="muted">LXC 107 | Cel: ER605 (__MAC__) | Kontroler: Omada SDN</small>
     </div>
-    <div class="row">
+    <div class="actions-row">
       <button onclick="manualCheck()">TEST PING WAN</button>
       <button class="btn-diag" onclick="manualDiag()">PEŁNA DIAGNOSTYKA WAN</button>
       <button class="danger" onclick="manualReboot()">WYMUŚ RESTART ER605</button>
@@ -497,57 +545,30 @@ HTML_PAGE = r"""<!doctype html>
     </div>
     <div class="card">
       <h2>OSTATNI RESTART / COOLDOWN</h2>
-      <div id="reboot" style="font-size: 16px; font-weight: bold;">--</div>
+      <div id="reboot" style="font-size: 15px; font-weight: bold;">--</div>
       <div id="cooldown" class="muted">Cooldown: --</div>
     </div>
   </div>
 
   <section class="card">
-    <h2>HISTORIA DIAGNOSTYKI (KAŻDA PRÓBA OFFLINE & TEST MANUALNY)</h2>
-    <div class="scroll">
-      <table>
-        <thead>
-          <tr>
-            <th>Czas</th>
-            <th>API Omada</th>
-            <th>Trasa LXC / Brama domyślna</th>
-            <th>Publiczne IP / Test DNS</th>
-            <th>Surowa odpowiedź Omady</th>
-          </tr>
-        </thead>
-        <tbody id="diag"></tbody>
-      </table>
-    </div>
+    <h2>HISTORIA DIAGNOSTYKI (OFFLINE & TESTY MANUALNE)</h2>
+    <div id="diag-container">Wczytywanie historii...</div>
   </section>
 
   <section class="card">
     <h2>AUDYT RESTARTÓW ROUTERA</h2>
-    <div class="scroll">
-      <table>
-        <thead>
-          <tr>
-            <th>Czas</th>
-            <th>Wyzwalacz</th>
-            <th>Wynik operacji</th>
-            <th>Zrzut stanu przed restartem</th>
-          </tr>
-        </thead>
-        <tbody id="audit"></tbody>
-      </table>
-    </div>
+    <div id="audit-container">Wczytywanie audytu...</div>
   </section>
 
   <section class="card">
-    <h2>KONSOLA OMADA OPEN API & DIAGNOSTYKA BŁĘDÓW</h2>
-    <small>Wybierz gotową operację lub wprowadź własny endpoint. Używaj wyłącznie w zaufanej sieci lokalnej LAN.</small>
+    <h2>KONSOLA OMADA OPEN API & DIAGNOSTYKA</h2>
+    <small class="muted">Wybierz gotową komendę lub wpisz własną ścieżkę. Używaj wyłącznie w sieci lokalnej.</small>
     
     <div class="row" style="margin-top: 10px;">
-      <label for="preset-select"><strong>Gotowe komendy:</strong></label>
       <select id="preset-select" onchange="applyPreset()">
         <option value="">-- Wybierz gotową komendę do Omady --</option>
-        <option value="er605_state">🔍 Stan i porty routera ER605 (uptime, link, konfiguracja)</option>
-        <option value="devices_list">📋 Lista wszystkich urządzeń w witrynie (switche, routery, AP)</option>
-        <option value="sites_list">🌐 Lista witryn w kontrolerze (identyfikatory i nazwy)</option>
+        <option value="devices_list">📋 Lista urządzeń w witrynie (ER605, switche, AP)</option>
+        <option value="sites_list">🌐 Lista witryn w kontrolerze (Site IDs)</option>
         <option value="events_global">⚠️ Zdarzenia systemowe kontrolera (Events)</option>
         <option value="logs_global">📑 Dziennik operacji kontrolera (Logs)</option>
         <option value="alerts_site">🚨 Alerty w bieżącej witrynie (Alerts)</option>
@@ -558,14 +579,14 @@ HTML_PAGE = r"""<!doctype html>
     <div id="preset-desc" class="preset-desc" style="display:none;"></div>
 
     <div class="row">
-      <select id="method" style="min-width: 100px;">
+      <select id="method" style="max-width: 100px;">
         <option>GET</option>
         <option>POST</option>
       </select>
       <input id="endpoint" placeholder="np. devices?page=1&pageSize=10 lub /openapi/v1/..." />
-      <button onclick="runApi()">WYŚLIJ DO KONTROLERA</button>
+      <button onclick="runApi()">WYŚLIJ</button>
     </div>
-    <textarea id="body" placeholder='Opcjonalne Body w formacie JSON dla zapytań POST (np. {"key": "value"})'></textarea>
+    <textarea id="body" placeholder='Opcjonalne Body w JSON dla POST'></textarea>
     <pre id="apiout">// Odpowiedź z kontrolera Omada pojawi się tutaj...</pre>
   </section>
 
@@ -580,35 +601,29 @@ const MAC = "__MAC__";
 const OMADAC_ID = "__OMADAC_ID__";
 
 const PRESETS = {
-  "er605_state": {
-    method: "GET",
-    endpoint: "devices/" + MAC,
-    body: "",
-    desc: "Pobiera szczegółowe dane o routerze ER605: czas pracy (uptime), stan portów LAN/WAN, adresy IP i status linku."
-  },
   "devices_list": {
     method: "GET",
-    endpoint: "devices?page=1&pageSize=10",
+    endpoint: "devices?page=1&pageSize=50",
     body: "",
-    desc: "Zwraca listę wszystkich zaadoptowanych urządzeń w bieżącej witrynie (router, przełączniki, access pointy)."
+    desc: "Zwraca pełną listę urządzeń w witrynie wraz ze statusem, czasem pracy (uptime), adresami IP i modelem routera ER605."
   },
   "sites_list": {
     method: "GET",
     endpoint: "/openapi/v1/" + OMADAC_ID + "/sites?page=1&pageSize=10",
     body: "",
-    desc: "Pobiera listę witryn skonfigurowanych w kontrolerze Omada (np. witryna 'dom' wraz z jej Site ID)."
+    desc: "Pobiera listę witryn skonfigurowanych w kontrolerze (np. witryna 'dom' wraz z jej Site ID)."
   },
   "events_global": {
     method: "GET",
     endpoint: "/openapi/v1/" + OMADAC_ID + "/events?page=1&pageSize=20",
     body: "",
-    desc: "Wyświetla ostatnie 20 zdarzeń sieciowych zarejestrowanych przez kontroler (rozłączenia linku, zmiany IP)."
+    desc: "Wyświetla ostatnie zdarzenia sieciowe (rozłączenia linku, zmiany konfiguracji)."
   },
   "logs_global": {
     method: "GET",
     endpoint: "/openapi/v1/" + OMADAC_ID + "/logs?page=1&pageSize=20",
     body: "",
-    desc: "Dziennik operacji i logów administracyjnych kontrolera Omada."
+    desc: "Dziennik operacji administracyjnych kontrolera Omada."
   },
   "alerts_site": {
     method: "GET",
@@ -620,7 +635,7 @@ const PRESETS = {
     method: "POST",
     endpoint: "devices/" + MAC + "/reboot",
     body: "",
-    desc: "Wysyła oficjalną komendę ponownego uruchomienia (reboot) do routera ER605 przez Open API."
+    desc: "Wysyła oficjalną komendę restartu do routera ER605 przez Open API."
   }
 };
 
@@ -640,11 +655,18 @@ function applyPreset() {
 }
 
 document.addEventListener('mousemove', e => {
-  document.getElementById('glow').style.background = `radial-gradient(circle at ${e.clientX}px ${e.clientY}px, rgba(0,255,102,.12), transparent 52%)`;
+  document.getElementById('glow').style.background = `radial-gradient(circle at ${e.clientX}px ${e.clientY}px, rgba(0,255,102,0.1), transparent 50%)`;
 });
 
 function esc(x) {
   return String(x ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function formatUptime(sec) {
+  if (!sec) return "0m";
+  let h = Math.floor(sec / 3600);
+  let m = Math.floor((sec % 3600) / 60);
+  return `${h}h ${m}m`;
 }
 
 async function refresh() {
@@ -659,29 +681,72 @@ async function refresh() {
     document.getElementById('reboot').textContent = d.last_reboot || 'Brak zarejestrowanych restartów';
     document.getElementById('cooldown').textContent = 'Cooldown ' + d.cooldown_hours + 'h: ' + (d.cooldown_active ? 'AKTYWNY' : 'Nieaktywny');
 
-    // Historia diagnostyki
-    document.getElementById('diag').innerHTML = (d.diagnostic_history || []).slice(0, 30).map(x => {
-      let l = x.lxc || {};
-      let errText = x.omada_error ? JSON.stringify(x.omada_error) : 'OK';
-      return `<tr>
-        <td>${esc(x.timestamp)}</td>
-        <td>HTTP ${esc(x.omada_http_code)}<br><small>${esc(errText)}</small></td>
-        <td class="diag"><pre>${esc(JSON.stringify({brama_lxc: l.lxc_gateway, ping_bramy: l.gateway_ping}, null, 2))}</pre></td>
-        <td class="diag"><pre>${esc(JSON.stringify({publiczne_pingi: l.public_ip_pings, test_dns: l.dns}, null, 2))}</pre></td>
-        <td><details><summary>Pokaż dane ER605</summary><pre>${esc(JSON.stringify(x.omada_device, null, 2))}</pre></details></td>
-      </tr>`;
-    }).join('') || '<tr><td colspan="5">Brak historii diagnostyki.</td></tr>';
+    // RWD Diagnostyka
+    let diagBox = document.getElementById('diag-container');
+    if (!d.diagnostic_history || d.diagnostic_history.length === 0) {
+      diagBox.innerHTML = '<div class="muted">Brak zapisanych danych diagnostycznych.</div>';
+    } else {
+      diagBox.innerHTML = d.diagnostic_history.slice(0, 15).map(x => {
+        let l = x.lxc || {};
+        let gw = l.gateway_ping || {};
+        let dns = l.dns || {};
+        let er = x.er605_info;
+        
+        let pingsHtml = (l.public_ip_pings || []).map(p => 
+          `<span class="badge ${p.ok ? 'badge-ok' : 'badge-fail'}">${p.target}: ${p.ok ? (p.latency_ms ? p.latency_ms.toFixed(0)+'ms' : 'OK') : 'BRAK'}</span>`
+        ).join(' ');
 
-    // Audyt restartów
-    document.getElementById('audit').innerHTML = (d.reboot_history || []).map(x => `<tr>
-      <td>${esc(x.timestamp)}</td>
-      <td>${esc(x.trigger)}</td>
-      <td style="color:${x.status === 'SUCCESS' ? 'var(--green)' : 'var(--red)'}; font-weight:bold;">${esc(x.status)} (HTTP ${esc(x.http_code)})</td>
-      <td><details><summary>Pokaż zrzut WAN</summary><pre>${esc(JSON.stringify(x.wan_diag, null, 2))}</pre></details></td>
-    </tr>`).join('') || '<tr><td colspan="4">Brak zarejestrowanych restartów.</td></tr>';
+        let erHtml = er ? 
+          `<span class="badge badge-info">ER605: Uptime ${formatUptime(er.uptime)} (${er.model})</span>` :
+          `<span class="badge badge-fail">ER605: ${esc(x.omada_error ? JSON.stringify(x.omada_error) : 'Brak danych')}</span>`;
+
+        return `
+          <div class="diag-card">
+            <div class="diag-head">
+              <strong>${esc(x.timestamp)}</strong>
+              <small>Omada HTTP: ${esc(x.omada_http_code || '--')}</small>
+            </div>
+            <div class="diag-badges">
+              <span class="badge ${gw.ok ? 'badge-ok' : 'badge-fail'}">Brama LAN (${esc(l.lxc_gateway || '?')}): ${gw.ok ? 'OK ('+ (gw.latency_ms ? gw.latency_ms.toFixed(1)+'ms' : '0ms')+')' : 'BRAK'}</span>
+              <span class="badge ${dns.ok ? 'badge-ok' : 'badge-fail'}">DNS: ${dns.ok ? 'OK ('+esc(dns.resolved_ip)+')' : 'BŁĄD'}</span>
+              ${erHtml}
+            </div>
+            <div class="diag-badges">
+              ${pingsHtml}
+            </div>
+            <details style="margin-top:6px;">
+              <summary style="cursor:pointer; font-size:11px; color:var(--text-muted);">Pokaż surowe dane JSON</summary>
+              <pre>${esc(JSON.stringify(x, null, 2))}</pre>
+            </details>
+          </div>
+        `;
+      }).join('');
+    }
+
+    // RWD Audyt Restartów
+    let auditBox = document.getElementById('audit-container');
+    if (!d.reboot_history || d.reboot_history.length === 0) {
+      auditBox.innerHTML = '<div class="muted">Brak zarejestrowanych restartów.</div>';
+    } else {
+      auditBox.innerHTML = d.reboot_history.slice(0, 10).map(x => `
+        <div class="diag-card">
+          <div class="diag-head">
+            <strong>${esc(x.timestamp)}</strong>
+            <span style="color:${x.status === 'SUCCESS' ? 'var(--green)' : 'var(--red)'}; font-weight:bold;">
+              ${esc(x.status)} (HTTP ${esc(x.http_code || '--')})
+            </span>
+          </div>
+          <div><strong>Wyzwalacz:</strong> ${esc(x.trigger)}</div>
+          <details style="margin-top:6px;">
+            <summary style="cursor:pointer; font-size:11px; color:var(--text-muted);">Zrzut stanu przed restartem</summary>
+            <pre>${esc(JSON.stringify(x.wan_diag, null, 2))}</pre>
+          </details>
+        </div>
+      `).join('');
+    }
 
     // Logi
-    document.getElementById('logs').innerHTML = (d.logs || []).map(x => esc(x)).join('<br>');
+    document.getElementById('logs').innerHTML = (d.logs || []).slice(0, 50).map(x => esc(x)).join('<br>');
   } catch (e) {
     console.error(e);
   }
@@ -689,18 +754,18 @@ async function refresh() {
 
 async function manualCheck() {
   await fetch('/api/manual-check', { method: 'POST' });
-  setTimeout(refresh, 1000);
+  setTimeout(refresh, 800);
 }
 
 async function manualDiag() {
   await fetch('/api/manual-diag', { method: 'POST' });
-  setTimeout(refresh, 1000);
+  setTimeout(refresh, 800);
 }
 
 async function manualReboot() {
   if (confirm('Czy na pewno chcesz wymusić natychmiastowy restart routera ER605 przez Open API?')) {
     await fetch('/api/manual-reboot', { method: 'POST' });
-    setTimeout(refresh, 1500);
+    setTimeout(refresh, 1200);
   }
 }
 
@@ -777,7 +842,6 @@ class WebHandler(BaseHTTPRequestHandler):
                 }
             return self.send_json(result)
 
-        # Wstrzyknięcie aktualnego adresu MAC i Omada ID do HTML-a
         mac_formatted = str(CONFIG.get("target_mac", "")).replace(":", "-").upper()
         page = HTML_PAGE.replace("__MAC__", mac_formatted).replace("__OMADAC_ID__", str(CONFIG.get("omadac_id", "")))
         body = page.encode("utf-8")
@@ -852,13 +916,9 @@ class WebHandler(BaseHTTPRequestHandler):
         try:
             diag = diagnose_wan_state()
             lxc = diag.get("lxc", {})
-            add_log(
-                "Diagnostyka ręczna zakończona: "
-                f"Omada HTTP={diag.get('omada_http_code')}, "
-                f"Brama={lxc.get('lxc_gateway')}, "
-                f"Ping={((lxc.get('gateway_ping') or {}).get('ok'))}, "
-                f"DNS={((lxc.get('dns') or {}).get('ok'))}"
-            )
+            gw_ok = (lxc.get("gateway_ping") or {}).get("ok")
+            dns_ok = (lxc.get("dns") or {}).get("ok")
+            add_log(f"Diagnostyka ręczna zakończona: Omada HTTP={diag.get('omada_http_code')}, Brama={gw_ok}, DNS={dns_ok}")
         except Exception as exc:
             add_log(f"Błąd diagnostyki ręcznej: {exc}")
         save_state()
