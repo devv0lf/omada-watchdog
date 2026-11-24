@@ -166,9 +166,11 @@ class OmadaClient:
         if not all((self.base_url, self.omada_id, self.client_id, self.client_secret)):
             log_message("Błąd Omada: uzupełnij URL, Omada ID, Client ID i Client Secret.")
             return None
-        url = f"{self.base_url}/openapi/authorize/token"
-        payload = {"omadacId": self.omada_id, "appId": self.client_id,
-                   "secret": self.client_secret}
+        # Omada Controller 6.x wymaga grant_type w query oraz nazw
+        # client_id / client_secret w JSON (zamiast appId / secret).
+        url = f"{self.base_url}/openapi/authorize/token?grant_type=client_credentials"
+        payload = {"omadacId": self.omada_id, "client_id": self.client_id,
+                   "client_secret": self.client_secret}
         req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
                                      headers={"Content-Type": "application/json"}, method="POST")
         try:
