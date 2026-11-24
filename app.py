@@ -490,9 +490,13 @@ class WebHandler(BaseHTTPRequestHandler):
         cfg = load_config()
         if path == "/api/check":
             online, latency = check_wan_connectivity(cfg)
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            dt_now = datetime.now()
+            now_str = dt_now.strftime("%Y-%m-%d %H:%M:%S")
             with lock:
-                state["wan_online"], state["latency_ms"], state["last_check"] = online, latency, now
+                state["wan_online"], state["latency_ms"], state["last_check"] = online, latency, now_str
+                state["history"].append({"t": dt_now.strftime("%H:%M"), "online": online, "lat": latency})
+                state["history"] = state["history"][-288:]
+            save_state()
             log_message(f"Ręczny test WAN: {'ONLINE' if online else 'OFFLINE'} ({latency} ms)")
             self.send_json_response(200, {"online": online, "latency_ms": latency})
         elif path == "/api/diagnostics":
@@ -585,7 +589,7 @@ async function triggerPing(){{try{{const d=await post('/api/check');alert('WAN: 
 async function triggerDiag(){{try{{await post('/api/diagnostics');alert('Diagnostyka zakończona.');location.reload()}}catch(e){{alert('Błąd: '+e)}}}}
 async function triggerReboot(){{if(!confirm('Czy na pewno wysłać polecenie restartu ER605?'))return;try{{const d=await post('/api/reboot');alert('Wynik: '+d.status+' (HTTP '+d.http_code+')');location.reload()}}catch(e){{alert('Restart nie powiódł się: '+e)}}}}
 function applyPreset(){{const val=document.getElementById('presetCmd').value;if(!val)return;const [method,path]=val.split('|');document.getElementById('apiMethod').value=method;document.getElementById('apiPath').value=path.replaceAll('{{site}}',{site}).replaceAll('{{mac}}',{mac_js})}}
-async function sendApiRequest(){{const out=document.getElementById('apiConsoleOutput');out.textContent='Wysyłanie...';try{{const d=await post('/api/omada/console',{{method:document.getElementById('apiMethod').value,path:document.getElementById('apiPath').value}});out.textContent='HTTP: '+d.http_code+'\nKOD OMADA: '+d.error_code+' — '+d.error_description+'\n\n'+JSON.stringify(d.response,null,2)}}catch(e){{out.textContent='BŁĄD: '+e}}}}
+async function sendApiRequest(){{const out=document.getElementById('apiConsoleOutput');out.textContent='Wysyłanie...';try{{const d=await post('/api/omada/console',{{method:document.getElementById('apiMethod').value,path:document.getElementById('apiPath').value}});out.textContent='HTTP: '+d.http_code+String.fromCharCode(10)+'KOD OMADA: '+d.error_code+' — '+d.error_description+String.fromCharCode(10,10)+JSON.stringify(d.response,null,2)}}catch(e){{out.textContent='BŁĄD: '+e}}}}
 </script></body></html>'''
         data = html_doc.encode("utf-8")
         self.send_response(200)
