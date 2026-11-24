@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Omada ER605 Watchdog & Cybernetic Dashboard (Omada SDN Open API v1)."""
+"""Omada ER605 Watchdog and local dashboard."""
 import copy
 import html
 import json
@@ -24,7 +24,8 @@ DEFAULT_CONFIG = {
     "client_id": "", "client_secret": "", "er605_mac": "",
     "check_interval_minutes": 30, "retry_interval_minutes": 1,
     "max_retries": 3, "cooldown_hours": 3, "web_port": 8080,
-    "post_reboot_wait_minutes": 10
+    "post_reboot_wait_minutes": 10,
+    "ping_hosts": ["1.1.1.1", "8.8.8.8", "1.0.0.1"],
 }
 OMADA_ERRORS = {
     0: "Operacja powiodła się", -1000: "Ogólny błąd kontrolera",
@@ -32,14 +33,15 @@ OMADA_ERRORS = {
     -1003: "Brak autoryzacji lub wygasły token", -1004: "Brak uprawnień",
     -1005: "Zasób nie istnieje", -1006: "Zasób jest zajęty",
     -1600: "Nieobsługiwana ścieżka", -30001: "Błędny Client ID lub Client Secret",
-    -30002: "Nieprawidłowy token autoryzacji", -39000: "Limit zapytań przekroczony"
+    -30002: "Nieprawidłowy token autoryzacji", -39000: "Limit zapytań przekroczony",
+    -44116: "Omada odrzuciła autoryzację Open API; sprawdź Omada ID, Client ID, Client Secret i aplikację Open API",
 }
 lock = threading.RLock()
 state = {
     "wan_online": True, "latency_ms": 0.0, "consecutive_fails": 0,
     "last_check": None, "next_check": None, "last_reboot": None,
     "cooldown_active": False, "history": [], "reboot_history": [],
-    "diagnostics_history": [], "logs": []
+    "diagnostics_history": [], "logs": [],
 }
 
 
@@ -54,14 +56,36 @@ def log_message(message):
 def load_config():
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg = DEFAULT_CONFIG.copy()
-            cfg.update(json.load(f))
-            return cfg
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            raise ValueError("config.json musi zawierać obiekt JSON")
+        cfg = DEFAULT_CONFIG.copy()
+        cfg.update(raw)
+        # Wsteczna zgodność z nazwami kluczy używanymi przez instalator.
+        for current, legacy in (("controller_url", "omada_url"),
+                                ("omada_id", "omadac_id"),
+                                ("er605_mac", "target_mac")):
+            if not raw.get(current) and raw.get(legacy):
+                cfg[current] = raw[legacy]
+        # Instalator może zapisywać retry_delay_seconds zamiast minut.
+        if "retry_interval_minutes" not in raw and "retry_delay_seconds" in raw:
+            seconds = max(1, int(raw["retry_delay_seconds"]))
+            cfg["retry_interval_minutes"] = max(1, (seconds + 59) // 60)
+        return cfg
     except FileNotFoundError:
         log_message(f"BŁĄD: Brak pliku konfiguracyjnego {CONFIG_PATH}")
     except Exception as exc:
         log_message(f"BŁĄD wczytywania config.json: {exc}")
     return DEFAULT_CONFIG.copy()
+
+
+def configured_ping_hosts(cfg):
+    hosts = cfg.get("ping_hosts", DEFAULT_CONFIG["ping_hosts"])
+    if isinstance(hosts, str):
+        hosts = [item.strip() for item in hosts.split(",") if item.strip()]
+    if not isinstance(hosts, list) or not hosts:
+        return DEFAULT_CONFIG["ping_hosts"]
+    return [str(host).strip() for host in hosts if str(host).strip()] or DEFAULT_CONFIG["ping_hosts"]
 
 
 def load_state():
@@ -80,12 +104,10 @@ def load_state():
 
 def save_state():
     with lock:
-        data = {
-            "reboot_history": state["reboot_history"][-50:],
-            "history": state["history"][-288:],
-            "diagnostics_history": state["diagnostics_history"][-30:],
-            "last_reboot": state["last_reboot"]
-        }
+        data = {"reboot_history": state["reboot_history"][-50:],
+                "history": state["history"][-288:],
+                "diagnostics_history": state["diagnostics_history"][:30],
+                "last_reboot": state["last_reboot"]}
     tmp_path = None
     try:
         fd, tmp_path = tempfile.mkstemp(prefix="state.", suffix=".tmp", dir=BASE_DIR)
@@ -116,8 +138,8 @@ def check_cooldown(cfg):
     if not last:
         return False
     try:
-        return datetime.now() - datetime.fromisoformat(last) < timedelta(
-            hours=float(cfg.get("cooldown_hours", 3)))
+        hours = max(0.0, float(cfg.get("cooldown_hours", 3)))
+        return datetime.now() - datetime.fromisoformat(last) < timedelta(hours=hours)
     except (TypeError, ValueError):
         return False
 
@@ -132,7 +154,7 @@ class OmadaClient:
         self.client_secret = str(cfg.get("client_secret", ""))
         self.token = None
         self.token_expire = 0
-        # Omada often uses a self-signed certificate on local controllers.
+        # Umożliwia lokalny kontroler z certyfikatem self-signed.
         self.ssl_ctx = ssl.create_default_context()
         self.ssl_ctx.check_hostname = False
         self.ssl_ctx.verify_mode = ssl.CERT_NONE
@@ -142,7 +164,7 @@ class OmadaClient:
         if self.token and now < self.token_expire:
             return self.token
         if not all((self.base_url, self.omada_id, self.client_id, self.client_secret)):
-            log_message("Błąd Omada: uzupełnij URL kontrolera, Omada ID, Client ID i Client Secret.")
+            log_message("Błąd Omada: uzupełnij URL, Omada ID, Client ID i Client Secret.")
             return None
         url = f"{self.base_url}/openapi/authorize/token"
         payload = {"omadacId": self.omada_id, "appId": self.client_id,
@@ -153,13 +175,18 @@ class OmadaClient:
             with urllib.request.urlopen(req, context=self.ssl_ctx, timeout=10) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             if data.get("errorCode", -1) != 0:
-                log_message(f"Błąd uzyskiwania tokenu Omada: {data.get('msg')} (kod {data.get('errorCode')})")
+                code = data.get("errorCode")
+                log_message(f"Błąd tokenu Omada: {data.get('msg')} (kod {code})")
                 return None
             result = data.get("result") or {}
             self.token = result.get("accessToken")
             expires_in = int(result.get("expiresIn", 7200))
             self.token_expire = now + max(60, expires_in - 120)
             return self.token
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            log_message(f"HTTP {exc.code} podczas pobierania tokenu Omada: {raw[:500]}")
+            return None
         except Exception as exc:
             log_message(f"Wyjątek podczas pobierania tokenu Omada: {exc}")
             return None
@@ -173,16 +200,16 @@ class OmadaClient:
             return 400, -1002, {"error": "Nieprawidłowa ścieżka API"}
         if not path.startswith("/"):
             path = "/" + path
-        parsed_path = urllib.parse.urlsplit(path)
-        if parsed_path.scheme or parsed_path.netloc:
+        parsed = urllib.parse.urlsplit(path)
+        if parsed.scheme or parsed.netloc:
             return 400, -1002, {"error": "Podaj ścieżkę API, nie pełny URL"}
         if not path.startswith("/openapi/"):
-            full_url = f"{self.base_url}/openapi/v1/{self.omada_id}{path}"
+            full_url = f"{self.base_url}/openapi/v1/{urllib.parse.quote(self.omada_id, safe='')}{path}"
         else:
             full_url = f"{self.base_url}{path}"
         token = self.get_token()
         if not token:
-            return 401, -1003, {"error": "Brak poprawnego tokenu autoryzacji"}
+            return 401, -1003, {"error": "Nie udało się pobrać tokenu autoryzacji"}
         headers = {"Content-Type": "application/json", "Authorization": f"AccessToken={token}"}
         data_bytes = json.dumps(body).encode("utf-8") if body is not None else None
         req = urllib.request.Request(full_url, data=data_bytes, headers=headers, method=method)
@@ -190,22 +217,23 @@ class OmadaClient:
             with urllib.request.urlopen(req, context=self.ssl_ctx, timeout=12) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
                 try:
-                    parsed = json.loads(raw)
+                    parsed_body = json.loads(raw)
                 except json.JSONDecodeError:
-                    parsed = {"raw": raw}
-                return resp.status, parsed.get("errorCode", 0), parsed
+                    parsed_body = {"raw": raw}
+                return resp.status, parsed_body.get("errorCode", 0), parsed_body
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="replace")
             try:
-                parsed = json.loads(raw)
+                parsed_body = json.loads(raw)
             except json.JSONDecodeError:
-                parsed = {"raw": raw or str(exc)}
-            return exc.code, parsed.get("errorCode", -1000), parsed
+                parsed_body = {"raw": raw or str(exc)}
+            return exc.code, parsed_body.get("errorCode", -1000), parsed_body
         except Exception as exc:
             return 500, -1000, {"error": str(exc)}
 
     def reboot_device(self, mac):
-        path = f"/sites/{urllib.parse.quote(self.site_id, safe='')}/devices/{urllib.parse.quote(format_mac_dashes(mac), safe='-')}/reboot"
+        mac_dash = urllib.parse.quote(format_mac_dashes(mac), safe="-")
+        path = f"/sites/{urllib.parse.quote(self.site_id, safe='')}/devices/{mac_dash}/reboot"
         return self.request("POST", path, body={})
 
     def get_er605_status(self, mac):
@@ -225,8 +253,9 @@ class OmadaClient:
                       in (target_dash, target_colon)), None)
         if not found:
             return {"http_code": http_code, "error_code": 404,
-                    "error_description": f"Nie znaleziono urządzenia {target_dash} na pierwszej stronie listy",
-                    "devices_count": len(devices), "available_macs": [d.get("mac") for d in devices]}
+                    "error_description": f"Nie znaleziono {target_dash} na pierwszej stronie listy",
+                    "devices_count": len(devices),
+                    "available_macs": [d.get("mac") for d in devices if isinstance(d, dict)]}
         return {"http_code": http_code, "error_code": 0,
                 "error_description": "Router zidentyfikowany", "device": found,
                 "summary": {"name": found.get("name"),
@@ -255,7 +284,7 @@ def ping_target(host, timeout=2):
 
 
 def run_full_network_diagnostics(cfg, trigger="MANUAL"):
-    log_message(f"Rozpoczęto pełną diagnostykę WAN (wyzwalacz: {trigger})...")
+    log_message(f"Rozpoczęto diagnostykę WAN (wyzwalacz: {trigger})...")
     gateway = "Nieznana"
     gateway_ping = {"ok": False, "output": "Brak"}
     try:
@@ -270,9 +299,9 @@ def run_full_network_diagnostics(cfg, trigger="MANUAL"):
     except Exception as exc:
         gateway = f"Błąd: {exc}"
     public_pings = []
-    for ip in ("1.1.1.1", "8.8.8.8"):
-        ok, latency, output = ping_target(ip, 2)
-        public_pings.append({"target": ip, "ok": ok, "latency_ms": latency, "output": output})
+    for host in configured_ping_hosts(cfg):
+        ok, latency, output = ping_target(host, 2)
+        public_pings.append({"target": host, "ok": ok, "latency_ms": latency, "output": output})
     try:
         answers = socket.getaddrinfo("example.com", 80)
         dns = {"ok": True, "output": "\n".join(sorted({a[4][0] for a in answers}))}
@@ -289,14 +318,15 @@ def run_full_network_diagnostics(cfg, trigger="MANUAL"):
         state["diagnostics_history"].insert(0, entry)
         state["diagnostics_history"] = state["diagnostics_history"][:30]
     save_state()
-    log_message(f"Diagnostyka zakończona: Omada HTTP={omada_status.get('http_code')}, "
-                f"brama={gateway}, ping publiczny={public_pings[0]['ok']}, DNS={dns['ok']}")
+    first_ping_ok = public_pings[0]["ok"] if public_pings else False
+    log_message(f"Diagnostyka: Omada HTTP={omada_status.get('http_code')}, brama={gateway}, "
+                f"ping publiczny={first_ping_ok}, DNS={dns['ok']}")
     return entry
 
 
-def check_wan_connectivity():
+def check_wan_connectivity(cfg):
     successes, latencies = 0, []
-    for target in ("1.1.1.1", "8.8.8.8", "1.0.0.1"):
+    for target in configured_ping_hosts(cfg):
         ok, latency, _ = ping_target(target, 2)
         if ok:
             successes += 1
@@ -318,13 +348,13 @@ def perform_reboot(cfg, trigger="AUTO_WATCHDOG_FAIL"):
               "omada_msg": response.get("msg", OMADA_ERRORS.get(err_code, "Nieznana odpowiedź")),
               "pre_reboot_snapshot": snapshot}
     with lock:
-        # Last attempt, including a failed request, starts cooldown to prevent rapid retries.
+        # Cooldown uruchamia się po każdej próbie, także nieudanej.
         state["last_reboot"] = now.isoformat()
         state["reboot_history"].insert(0, record)
         state["reboot_history"] = state["reboot_history"][:50]
     save_state()
-    log_message(("SUKCES: kontroler przyjął polecenie restartu." if success else
-                 f"BŁĄD restartu: HTTP {http_code}, kod {err_code}, odpowiedź: {response}"))
+    log_message("SUKCES: kontroler przyjął polecenie restartu." if success else
+                f"BŁĄD restartu: HTTP {http_code}, kod {err_code}, odpowiedź: {response}")
     return success, record
 
 
@@ -332,9 +362,9 @@ def watchdog_loop():
     log_message("Watchdog WAN wystartował. Pętla monitorowania aktywna.")
     while True:
         cfg = load_config()
-        online, latency = check_wan_connectivity()
+        online, latency = check_wan_connectivity(cfg)
         now = datetime.now()
-        cooldown = check_cooldown(cfg)  # celowo poza sekcją lock
+        cooldown = check_cooldown(cfg)
         with lock:
             state["wan_online"] = online
             state["latency_ms"] = latency
@@ -350,7 +380,7 @@ def watchdog_loop():
         save_state()
         if online:
             delay = max(1, int(cfg.get("check_interval_minutes", 30)))
-            log_message(f"Status: ONLINE ({latency} ms). Kolejne sprawdzenie za {delay} min.")
+            log_message(f"Status: ONLINE ({latency} ms). Kolejny test za {delay} min.")
         else:
             max_fails = max(1, int(cfg.get("max_retries", 3)))
             log_message(f"ALERT: Brak WAN! Próba {fails}/{max_fails}.")
@@ -363,7 +393,7 @@ def watchdog_loop():
                     log_message(f"Osiągnięto limit {max_fails} prób offline. Wysyłam restart ER605.")
                     perform_reboot(cfg, trigger="AUTO_WATCHDOG_FAIL")
                     delay = max(1, int(cfg.get("post_reboot_wait_minutes", 10)))
-                    log_message(f"Czekam {delay} min po poleceniu restartu przed kolejnym testem.")
+                    log_message(f"Test po restarcie za {delay} min.")
             else:
                 delay = max(1, int(cfg.get("retry_interval_minutes", 1)))
                 log_message(f"Kolejna próba {fails + 1}/{max_fails} za {delay} min.")
@@ -384,7 +414,7 @@ def generate_svg_chart(history):
     width, height, pad = 900, 150, 30
     max_lat = max([float(p.get("lat") or 0) for p in points] + [60.0])
     step = (width - 2 * pad) / (len(points) - 1)
-    bars, path = [], []
+    marks, path = [], []
     for i, point in enumerate(points):
         x = pad + i * step
         try:
@@ -394,22 +424,22 @@ def generate_svg_chart(history):
         online = bool(point.get("online"))
         y = height - pad if not online else height - pad - latency / max_lat * (height - 2 * pad)
         if not online:
-            bars.append(f'<line x1="{x:.1f}" y1="{pad}" x2="{x:.1f}" y2="{height-pad}" stroke="#ff3333" stroke-width="2"><title>{esc(point.get("t"))}: OFFLINE</title></line>')
+            marks.append(f'<line x1="{x:.1f}" y1="{pad}" x2="{x:.1f}" y2="{height-pad}" stroke="#ff3333" stroke-width="2"><title>{esc(point.get("t"))}: OFFLINE</title></line>')
         else:
-            bars.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2" fill="#00ff66"><title>{esc(point.get("t"))}: {latency:.1f} ms</title></circle>')
+            marks.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2" fill="#00ff66"><title>{esc(point.get("t"))}: {latency:.1f} ms</title></circle>')
         path.append(("M" if i == 0 else "L") + f" {x:.1f} {y:.1f}")
-    return f'''<svg viewBox="0 0 {width} {height}" class="chart" role="img" aria-label="Wykres łączności WAN z 24 godzin">
+    return f'''<svg viewBox="0 0 {width} {height}" class="chart" role="img" aria-label="Wykres WAN z 24 godzin">
       <line x1="{pad}" y1="{height-pad}" x2="{width-pad}" y2="{height-pad}" stroke="#1a4d26"/>
       <text x="{pad}" y="18" fill="#00aa44" font-size="10">Maks. opóźnienie: {max_lat:.0f} ms</text>
       <text x="{width-pad}" y="18" fill="#00aa44" font-size="10" text-anchor="end">Ostatnie 24 h</text>
-      {''.join(bars)}<path d="{' '.join(path)}" fill="none" stroke="#00ff66" stroke-width="1.5" opacity=".7"/>
+      {''.join(marks)}<path d="{' '.join(path)}" fill="none" stroke="#00ff66" stroke-width="1.5" opacity=".7"/>
       <text x="{pad}" y="{height-6}" fill="#00aa44" font-size="10">{esc(points[0].get('t'))}</text>
       <text x="{width-pad}" y="{height-6}" fill="#00aa44" font-size="10" text-anchor="end">{esc(points[-1].get('t'))}</text>
     </svg>'''
 
 
 class WebHandler(BaseHTTPRequestHandler):
-    server_version = "OmadaWatchdog/1.1"
+    server_version = "OmadaWatchdog/1.2"
 
     def log_message(self, fmt, *args):
         return
@@ -424,6 +454,7 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
+        self.close_connection = True
 
     def do_HEAD(self):
         if urllib.parse.urlsplit(self.path).path in ("/", "/index.html"):
@@ -433,6 +464,7 @@ class WebHandler(BaseHTTPRequestHandler):
             self.end_headers()
         else:
             self.send_error(404)
+        self.close_connection = True
 
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path).path
@@ -455,7 +487,7 @@ class WebHandler(BaseHTTPRequestHandler):
         path = urllib.parse.urlsplit(self.path).path
         cfg = load_config()
         if path == "/api/check":
-            online, latency = check_wan_connectivity()
+            online, latency = check_wan_connectivity(cfg)
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with lock:
                 state["wan_online"], state["latency_ms"], state["last_check"] = online, latency, now
@@ -519,7 +551,6 @@ class WebHandler(BaseHTTPRequestHandler):
             audit_rows.append('<tr><td colspan="4" class="empty">Brak zarejestrowanych restartów.</td></tr>')
         logs = esc("\n".join(st["logs"][-35:]))
         chart = generate_svg_chart(st["history"])
-        site = esc(cfg.get("site_id", ""))
         mac = esc(cfg.get("er605_mac", ""))
         mac_dash = esc(format_mac_dashes(cfg.get("er605_mac", "")))
         controller = esc(cfg.get("controller_url", ""))
@@ -529,10 +560,12 @@ class WebHandler(BaseHTTPRequestHandler):
         last_reboot = esc(st.get("last_reboot") or "Brak")
         latency = esc(st.get("latency_ms", 0))
         cooldown_hours = esc(cfg.get("cooldown_hours", 3))
+        site = json.dumps(str(cfg.get("site_id", "")))
+        mac_js = json.dumps(format_mac_dashes(cfg.get("er605_mac", "")))
         html_doc = f'''<!doctype html><html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Omada ER605 Watchdog</title>
 <style>
 :root{{--bg:#050807;--card:rgba(7,18,11,.88);--border:#13381e;--green:#00ff66;--dim:#00aa44;--red:#ff4444}}*{{box-sizing:border-box}}body{{margin:0;padding:16px;background:#050807;background-image:radial-gradient(circle at var(--mx,50%) var(--my,50%),rgba(0,255,102,.08),transparent 60%);color:#b8e6c4;font:14px Consolas,'Courier New',monospace;min-height:100vh}}.container{{max-width:1100px;margin:auto}}header{{border-bottom:2px solid var(--border);padding-bottom:12px;margin-bottom:20px}}h1{{font-size:1.3rem;color:var(--green);margin:0 0 6px;text-shadow:0 0 8px #00ff6655}}.node-info,.card-title,.card-sub{{color:#77a885;font-size:.85rem}}.actions,.row{{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:18px}}button,select,input{{font:inherit;background:#091a10;color:var(--green);border:1px solid var(--border);padding:9px 12px;border-radius:4px}}button{{cursor:pointer}}button:hover{{background:#11381e;border-color:var(--green)}}.danger{{color:#ff7777;border-color:#551111}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px;margin-bottom:22px}}.card,.diag-card,.console{{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:14px}}.card-title{{text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}}.value{{font-size:1.5rem;font-weight:bold;color:var(--green)}}.section{{font-size:1rem;color:var(--green);border-left:3px solid var(--green);padding-left:8px;margin:26px 0 12px}}.chart{{width:100%;height:auto;display:block;background:#000a05;border:1px solid var(--border);border-radius:4px}}.diag-card{{margin-bottom:10px}}.diag-header{{display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px;border-bottom:1px solid #142e1b;padding-bottom:7px;margin-bottom:8px}}.diag-summary{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;font-size:.85rem;margin:10px 0}}.badge{{display:inline-block;border:1px solid #16803a;border-radius:3px;padding:2px 6px;margin:2px;font-size:.75rem}}.badge-ok{{color:var(--green);border-color:#00aa44}}.badge-err{{color:#ff5555;border-color:#aa2222}}.green{{color:var(--green)}}details{{margin-top:8px}}summary{{cursor:pointer;color:#00cc55}}.json-box{{background:#030805;border:1px solid #0f2b17;padding:10px;border-radius:4px;color:#9fe0b0;font-size:.8rem;max-height:280px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}}table{{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--border)}}th,td{{padding:9px;text-align:left;border-bottom:1px solid var(--border);overflow-wrap:anywhere}}th{{color:var(--green);background:#091c10}}.table-wrap{{overflow-x:auto}}input[type=text]{{flex:1;min-width:220px}}.console{{margin-bottom:20px}}.empty{{color:#008833;padding:14px;text-align:center}}#logOutput{{width:100%;height:220px}}@media(max-width:650px){{body{{padding:8px}}h1{{font-size:1.05rem}}.actions button{{width:100%}}.row{{flex-direction:column}}input[type=text]{{width:100%;min-width:0}}th,td{{font-size:.75rem;padding:6px}}}}
-</style></head><body><main class="container"><header><h1>OMADA ER605 WATCHDOG // SYSTEM CYBERNETYCZNY</h1><div class="node-info">Węzeł: LXC 107 | Cel: ER605 ({mac}) | Kontroler: {controller}</div></header>
+</style></head><body><main class="container"><header><h1>OMADA ER605 WATCHDOG // SYSTEM CYBERNETYCZNY</h1><div class="node-info">Węzeł: LXC | Cel: ER605 ({mac}) | Kontroler: {controller}</div></header>
 <div class="actions"><button onclick="triggerPing()">TEST PING WAN</button><button onclick="triggerDiag()">PEŁNA DIAGNOSTYKA WAN</button><button class="danger" onclick="triggerReboot()">WYMUŚ RESTART ER605</button></div>
 <div class="grid"><section class="card"><div class="card-title">Status WAN</div><div class="value" style="color:{status_color}">{status_text}</div><div class="card-sub">Latencja: {latency} ms</div></section>
 <section class="card"><div class="card-title">Błędy / kolejny cykl</div><div class="value">{fail_count} / {max_retries}</div><div class="card-sub">Następny test: {next_check}</div></section>
@@ -540,7 +573,7 @@ class WebHandler(BaseHTTPRequestHandler):
 <h2 class="section">Historia łączności i latencji (24 godziny)</h2>{chart}
 <h2 class="section">Historia diagnostyki (offline i testy ręczne)</h2>{''.join(diag_cards)}
 <h2 class="section">Audyt restartów routera</h2><div class="table-wrap"><table><thead><tr><th>Czas</th><th>Wyzwalacz</th><th>Wynik</th><th>Zrzut przed restartem</th></tr></thead><tbody>{''.join(audit_rows)}</tbody></table></div>
-<h2 class="section">Konsola Omada Open API</h2><div class="console"><label for="presetCmd">Gotowe komendy:</label><select id="presetCmd" onchange="applyPreset()" style="width:100%;margin:6px 0 12px"><option value="">-- Wybierz komendę --</option><option value="GET|/sites/{site}/devices?page=1&amp;pageSize=50">Lista urządzeń witryny</option><option value="GET|/sites/{site}/gateways">Bramy witryny (endpoint może zależeć od wersji API)</option><option value="GET|/sites?page=1&amp;pageSize=50">Lista witryn</option><option value="GET|/sites/{site}/events?page=1&amp;pageSize=50">Zdarzenia (jeśli obsługiwane przez kontroler)</option><option value="GET|/sites/{site}/alerts?page=1&amp;pageSize=50">Alerty (jeśli obsługiwane przez kontroler)</option><option value="POST|/sites/{site}/devices/{mac}/reboot">Restart ER605</option></select>
+<h2 class="section">Konsola Omada Open API</h2><div class="console"><label for="presetCmd">Gotowe komendy:</label><select id="presetCmd" onchange="applyPreset()" style="width:100%;margin:6px 0 12px"><option value="">-- Wybierz komendę --</option><option value="GET|/sites/{{site}}/devices?page=1&amp;pageSize=50">Lista urządzeń witryny</option><option value="GET|/sites/{{site}}/gateways">Bramy witryny (endpoint zależy od wersji API)</option><option value="GET|/sites?page=1&amp;pageSize=50">Lista witryn</option><option value="GET|/sites/{{site}}/events?page=1&amp;pageSize=50">Zdarzenia (jeśli obsługiwane)</option><option value="GET|/sites/{{site}}/alerts?page=1&amp;pageSize=50">Alerty (jeśli obsługiwane)</option><option value="POST|/sites/{{site}}/devices/{{mac}}/reboot">Restart ER605</option></select>
 <div class="row"><select id="apiMethod"><option>GET</option><option>POST</option></select><input type="text" id="apiPath" placeholder="/sites/.../devices?page=1&amp;pageSize=50"><button onclick="sendApiRequest()">WYŚLIJ</button></div><label>Odpowiedź kontrolera:</label><pre id="apiConsoleOutput" class="json-box">Oczekiwanie na zapytanie...</pre></div>
 <h2 class="section">Logi systemowe</h2><textarea id="logOutput" class="json-box" readonly>{logs}</textarea></main>
 <script>
@@ -549,7 +582,7 @@ async function post(path,body){{const r=await fetch(path,{{method:'POST',headers
 async function triggerPing(){{try{{const d=await post('/api/check');alert('WAN: '+(d.online?'ONLINE':'OFFLINE')+' ('+d.latency_ms+' ms)');location.reload()}}catch(e){{alert('Błąd: '+e)}}}}
 async function triggerDiag(){{try{{await post('/api/diagnostics');alert('Diagnostyka zakończona.');location.reload()}}catch(e){{alert('Błąd: '+e)}}}}
 async function triggerReboot(){{if(!confirm('Czy na pewno wysłać polecenie restartu ER605?'))return;try{{const d=await post('/api/reboot');alert('Wynik: '+d.status+' (HTTP '+d.http_code+')');location.reload()}}catch(e){{alert('Restart nie powiódł się: '+e)}}}}
-function applyPreset(){{const val=document.getElementById('presetCmd').value;if(!val)return;const [method,path]=val.split('|');document.getElementById('apiMethod').value=method;document.getElementById('apiPath').value=path.replaceAll('{{site}}',{json.dumps(site)}).replaceAll('{{mac}}',{json.dumps(mac_dash)})}}
+function applyPreset(){{const val=document.getElementById('presetCmd').value;if(!val)return;const [method,path]=val.split('|');document.getElementById('apiMethod').value=method;document.getElementById('apiPath').value=path.replaceAll('{{site}}',{site}).replaceAll('{{mac}}',{mac_js})}}
 async function sendApiRequest(){{const out=document.getElementById('apiConsoleOutput');out.textContent='Wysyłanie...';try{{const d=await post('/api/omada/console',{{method:document.getElementById('apiMethod').value,path:document.getElementById('apiPath').value}});out.textContent='HTTP: '+d.http_code+'\nKOD OMADA: '+d.error_code+' — '+d.error_description+'\n\n'+JSON.stringify(d.response,null,2)}}catch(e){{out.textContent='BŁĄD: '+e}}}}
 </script></body></html>'''
         data = html_doc.encode("utf-8")
@@ -562,6 +595,7 @@ async function sendApiRequest(){{const out=document.getElementById('apiConsoleOu
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
+        self.close_connection = True
 
 
 def run_server(port=8080):
