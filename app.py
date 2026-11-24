@@ -384,6 +384,21 @@ class OmadaClient:
         path = f"/sites/{urllib.parse.quote(self.site_id, safe='')}/devices/{mac_dash}/reboot"
         return self.request("POST", path, body={})
 
+    def get_gateway_wan_status(self, mac):
+        mac_dash = format_mac_dashes(mac).upper()
+        path = f"/sites/{urllib.parse.quote(self.site_id, safe='')}/gateways/{mac_dash}/wan-status"
+        http_code, code, response = self.request("GET", path)
+        if http_code != 200 or code != 0:
+            return {"http_code": http_code, "error_code": code,
+                    "error_description": OMADA_ERRORS.get(code, "Błąd kontrolera"),
+                    "wan_ports": [], "raw_response": response}
+        wan_list = response.get("result", [])
+        if not isinstance(wan_list, list):
+            wan_list = []
+        return {"http_code": http_code, "error_code": 0,
+                "error_description": "Pobrano status portów WAN",
+                "wan_ports": wan_list, "raw_response": response}
+
     def get_er605_status(self, mac):
         target_dash = format_mac_dashes(mac).upper()
         target_colon = target_dash.replace("-", ":")
@@ -531,22 +546,37 @@ def run_full_network_diagnostics(cfg, trigger="MANUAL"):
             dns = {"ok": True, "output": "\n".join(sorted({a[4][0] for a in answers}))}
         except Exception as exc:  # noqa: BLE001
             dns = {"ok": False, "output": f"DNS resolution failed: {exc}"}
+        omada_status = {}
+        wan_status = {}
         try:
-            omada_status = get_omada(cfg).get_er605_status(cfg.get("er605_mac", ""))
+            omada_client = get_omada(cfg)
+            mac_cfg = cfg.get("er605_mac", "")
+            omada_status = omada_client.get_er605_status(mac_cfg)
+            wan_status = omada_client.get_gateway_wan_status(mac_cfg)
         except Exception as exc:  # noqa: BLE001
             omada_status = {"http_code": 500, "error_code": -1000,
-                            "error_description": f"Wyjątek: {exc}"}
+                            "error_description": f"Wyjątek routera: {exc}"}
+            wan_status = {"http_code": 500, "error_code": -1000,
+                          "error_description": f"Wyjątek WAN: {exc}", "wan_ports": []}
+        wan_ports = wan_status.get("wan_ports", [])
         entry = {"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "trigger": trigger,
                  "api_omada": {"http_code": omada_status.get("http_code"),
                                "code": omada_status.get("error_code"),
                                "description": omada_status.get("error_description")},
+                 "wan_ports": wan_ports,
                  "lxc_route": {"brama_lxc": gateway, "ping_bramy": gateway_ping},
-                 "public_pings": public_pings, "test_dns": dns, "omada_raw": omada_status}
+                 "public_pings": public_pings, "test_dns": dns,
+                 "omada_raw": {"router": omada_status, "wan_status": wan_status}}
         with lock:
             state["diagnostics_history"].insert(0, entry)
             state["diagnostics_history"] = state["diagnostics_history"][:30]
         save_state()
-        log_message(f"Diagnostyka: Omada HTTP={omada_status.get('http_code')}, brama={gateway}, "
+        wan_info = "brak danych WAN"
+        if wan_ports:
+            p = wan_ports[0]
+            p_up_str = "UP" if p.get("status") == 1 else "DOWN"
+            wan_info = f"{p.get('name', 'WAN')}: link={p_up_str}, IP={p.get('ip', 'brak')}, errs=RX:{p.get('rxErrorPkts', 0)}/TX:{p.get('txErrorPkts', 0)}"
+        log_message(f"Diagnostyka: Omada HTTP={omada_status.get('http_code')}, {wan_info}, brama LXC={gateway}, "
                     f"ping publiczny={any(p['ok'] for p in public_pings)}, DNS={dns['ok']}")
         return entry
 
@@ -699,7 +729,7 @@ def generate_svg_chart(history):
 
 PAGE_CSS = r""":root{--bg:#050807;--card:rgba(7,18,11,.88);--border:#13381e;--green:#00ff66;--dim:#00aa44;--red:#ff4444}*{box-sizing:border-box}body{margin:0;padding:16px;background:#050807;background-image:radial-gradient(circle at var(--mx,50%) var(--my,50%),rgba(0,255,102,.08),transparent 60%);color:#b8e6c4;font:14px Consolas,'Courier New',monospace;min-height:100vh}.container{max-width:1100px;margin:auto}header{border-bottom:2px solid var(--border);padding-bottom:12px;margin-bottom:20px}h1{font-size:1.3rem;color:var(--green);margin:0 0 6px;text-shadow:0 0 8px #00ff6655}.node-info,.card-title,.card-sub{color:#77a885;font-size:.85rem}.actions,.row{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:18px}button,select,input,textarea{font:inherit;background:#091a10;color:var(--green);border:1px solid var(--border);padding:9px 12px;border-radius:4px}button{cursor:pointer}button:hover{background:#11381e;border-color:var(--green)}.danger{color:#ff7777;border-color:#551111}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px;margin-bottom:22px}.card,.diag-card,.console{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:14px}.card-title{text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}.value{font-size:1.5rem;font-weight:bold;color:var(--green)}.section{font-size:1rem;color:var(--green);border-left:3px solid var(--green);padding-left:8px;margin:26px 0 12px}.chart{width:100%;height:auto;display:block;background:#000a05;border:1px solid var(--border);border-radius:4px}.diag-card{margin-bottom:10px}.diag-header{display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px;border-bottom:1px solid #142e1b;padding-bottom:7px;margin-bottom:8px}.diag-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;font-size:.85rem;margin:10px 0}.badge{display:inline-block;border:1px solid #16803a;border-radius:3px;padding:2px 6px;margin:2px;font-size:.75rem}.badge-ok{color:var(--green);border-color:#00aa44}.badge-err{color:#ff5555;border-color:#aa2222}.green{color:var(--green)}details{margin-top:8px}summary{cursor:pointer;color:#00cc55}.json-box{background:#030805;border:1px solid #0f2b17;padding:10px;border-radius:4px;color:#9fe0b0;font-size:.8rem;max-height:280px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--border)}th,td{padding:9px;text-align:left;border-bottom:1px solid var(--border);overflow-wrap:anywhere}th{color:var(--green);background:#091c10}.table-wrap{overflow-x:auto}input[type=text]{flex:1;min-width:220px}.console{margin-bottom:20px}.empty{color:#008833;padding:14px;text-align:center}#logOutput{width:100%;height:220px}#apiBody{width:100%;height:70px;margin-bottom:12px}@media(max-width:650px){body{padding:8px}h1{font-size:1.05rem}.actions button{width:100%}.row{flex-direction:column}input[type=text]{width:100%;min-width:0}th,td{font-size:.75rem;padding:6px}}"""
 
-PRESET_OPTIONS = '''<option value="">-- Wybierz komendę --</option><option value="GET|/sites/{site}/devices?page=1&amp;pageSize=50">Lista urządzeń witryny</option><option value="GET|/sites/{site}/gateways">Bramy witryny (endpoint zależy od wersji API)</option><option value="GET|/sites?page=1&amp;pageSize=50">Lista witryn</option><option value="GET|/sites/{site}/events?page=1&amp;pageSize=50">Zdarzenia (jeśli obsługiwane)</option><option value="GET|/sites/{site}/alerts?page=1&amp;pageSize=50">Alerty (jeśli obsługiwane)</option><option value="POST|/sites/{site}/devices/{mac}/reboot">Restart ER605</option>'''
+PRESET_OPTIONS = '''<option value="">-- Wybierz komendę --</option><option value="GET|/sites/{site}/gateways/{mac}/wan-status">Status WAN1 i kabla (Link UP/DOWN, błędy RX/TX, IP ZTE)</option><option value="GET|/sites/{site}/gateways/{mac}">Szczegóły bramy ER605 i konfiguracja portów</option><option value="GET|/sites/{site}/devices?page=1&amp;pageSize=50">Lista urządzeń witryny</option><option value="GET|/sites?page=1&amp;pageSize=50">Lista witryn</option><option value="GET|/sites/{site}/events?page=1&amp;pageSize=50">Zdarzenia (jeśli obsługiwane)</option><option value="GET|/sites/{site}/alerts?page=1&amp;pageSize=50">Alerty (jeśli obsługiwane)</option><option value="POST|/sites/{site}/devices/{mac}/reboot">Restart ER605</option>'''
 
 PAGE_JS = r"""const SITE=__SITE__,MAC=__MAC__,COOLDOWN=__COOLDOWN__;
 const $=id=>document.getElementById(id);
@@ -852,25 +882,72 @@ class WebHandler(BaseHTTPRequestHandler):
         diag_cards = []
         for item in st["diagnostics_history"][:10]:
             api = item.get("api_omada", {})
-            code = api.get("code", "?")
-            api_color = "#00ff66" if code == 0 else "#ffaa00"
+            api_c = api.get("code", "?")
+            api_color = "#00ff66" if api_c == 0 else "#ffaa00"
             route = item.get("lxc_route", {})
             gw_ok = route.get("ping_bramy", {}).get("ok", False)
             dns_ok = item.get("test_dns", {}).get("ok", False)
             raw = esc(json.dumps(item.get("omada_raw", {}), indent=2, ensure_ascii=False))
-            diag_cards.append(f'''<article class="diag-card"><div class="diag-header"><div><b class="green">{esc(item.get('timestamp'))}</b> <span class="badge">{esc(item.get('trigger'))}</span></div>
-              <div><span class="badge" style="color:{api_color}">Omada: {esc(code)}</span><span class="badge {'badge-ok' if gw_ok else 'badge-err'}">Brama {'OK' if gw_ok else 'FAIL'}</span><span class="badge {'badge-ok' if dns_ok else 'badge-err'}">DNS {'OK' if dns_ok else 'FAIL'}</span></div></div>
-              <div class="diag-summary"><div><b>Brama LAN LXC:</b> {esc(route.get('brama_lxc', 'brak'))}</div><div><b>Omada API:</b> {esc(api.get('description', ''))}</div></div>
-              <details><summary>Pokaż surowe dane ER605 / odpowiedź API</summary><pre class="json-box">{raw}</pre></details></article>''')
+
+            wan_lines = []
+            ports = item.get("wan_ports") or []
+            if not ports and isinstance(item.get("omada_raw"), dict):
+                ports = item["omada_raw"].get("wan_status", {}).get("wan_ports", [])
+
+            for p in ports:
+                p_name = esc(p.get("name") or f"WAN{p.get('port', 1)}")
+                p_up = (p.get("status") == 1)
+                p_inet = (p.get("internetState") == 1)
+                speed_code = p.get("speed")
+                speed_str = "1000M" if speed_code == 3 else ("100M" if speed_code == 2 else ("10M" if speed_code == 1 else str(speed_code or "?")))
+                duplex_str = "Full" if p.get("duplex") == 2 else ("Half" if p.get("duplex") == 1 else "")
+                link_text = f"{p_name} LINK UP ({speed_str} {duplex_str})" if p_up else f"{p_name} LINK DOWN (Brak kabla/ZTE off)"
+                link_cls = "badge-ok" if p_up else "badge-err"
+                inet_cls = "badge-ok" if p_inet else "badge-err"
+                inet_text = "Internet: ONLINE" if p_inet else "Internet: OFFLINE"
+                rx_err = p.get("rxErrorPkts", 0)
+                tx_err = p.get("txErrorPkts", 0)
+                err_color = "#ff5555" if (rx_err > 0 or tx_err > 0) else "var(--green)"
+                cable_badge = f'<span class="badge" style="color:{err_color};border-color:{err_color}">Kabel błędy RX/TX: {rx_err}/{tx_err}</span>'
+                ip_val = esc(p.get("ip") or p.get("wanPortIpv4Config", {}).get("ip") or "brak IP")
+                gw_val = esc(p.get("wanPortIpv4Config", {}).get("gateway") or "brak bramy")
+                loss = p.get("loss", 0.0)
+                lat = p.get("latency", 0)
+                wan_lines.append(f'''<div style="margin:4px 0">
+                  <div><b>Fizyczny link:</b> <span class="badge {link_cls}">{esc(link_text)}</span> <span class="badge {inet_cls}">{esc(inet_text)}</span> {cable_badge}</div>
+                  <div style="margin-top:5px"><b>IP od ZTE:</b> {ip_val} &nbsp;|&nbsp; <b>Brama ZTE:</b> {gw_val} &nbsp;|&nbsp; <b>Opóźnienie:</b> {lat} ms (utrata: {loss}%)</div>
+                </div>''')
+
+            wan_html = "".join(wan_lines) if wan_lines else '<div style="color:#77a885;font-size:0.85rem">Brak portów WAN w tym zrzucie.</div>'
+            gw_cls = "badge-ok" if gw_ok else "badge-err"
+            gw_txt = "Brama LAN OK" if gw_ok else "Brama LAN FAIL"
+            dns_cls = "badge-ok" if dns_ok else "badge-err"
+            dns_txt = "DNS OK" if dns_ok else "DNS FAIL"
+
+            diag_cards.append(f'''<article class="diag-card"><div class="diag-header"><div><b class="green">{esc(item.get("timestamp"))}</b> <span class="badge">{esc(item.get("trigger"))}</span></div>
+              <div><span class="badge" style="color:{api_color}">Omada: {esc(api_c)}</span><span class="badge {gw_cls}">{gw_txt}</span><span class="badge {dns_cls}">{dns_txt}</span></div></div>
+              <div class="diag-summary"><div><b>Brama LAN LXC:</b> {esc(route.get("brama_lxc", "brak"))}</div><div><b>Omada API:</b> {esc(api.get("description", ""))}</div></div>
+              <div style="background:#020603;border:1px solid #0f2e18;border-radius:4px;padding:8px;margin:8px 0">{wan_html}</div>
+              <details><summary>Pokaż surowe dane ER605 / wan-status API</summary><pre class="json-box">{raw}</pre></details></article>''')
         if not diag_cards:
             diag_cards.append('<div class="empty">Brak wpisów diagnostycznych.</div>')
         audit_rows = []
         for record in st["reboot_history"][:10]:
             color = "#00ff66" if record.get("status") == "SUCCESS" else "#ff3333"
-            snapshot = esc(json.dumps(record.get("pre_reboot_snapshot", {}), indent=2, ensure_ascii=False))
-            audit_rows.append(f'''<tr><td>{esc(record.get('timestamp'))}</td><td><code>{esc(record.get('trigger'))}</code></td>
-              <td style="color:{color};font-weight:bold">{esc(record.get('status'))} (HTTP {esc(record.get('http_code'))})</td>
-              <td><details><summary>Zrzut WAN</summary><pre class="json-box">{snapshot}</pre></details></td></tr>''')
+            snap_obj = record.get("pre_reboot_snapshot", {})
+            snapshot = esc(json.dumps(snap_obj, indent=2, ensure_ascii=False))
+            wan_snap_summary = "Brak danych WAN"
+            snap_ports = snap_obj.get("wan_ports") or []
+            if snap_ports:
+                sp = snap_ports[0]
+                sp_up = (sp.get("status") == 1)
+                sp_ip = sp.get("ip") or "brak IP"
+                sp_err = f"RX:{sp.get('rxErrorPkts', 0)}/TX:{sp.get('txErrorPkts', 0)}"
+                wan_snap_up = "LINK UP" if sp_up else "LINK DOWN"
+                wan_snap_summary = f"WAN1: {wan_snap_up}, IP: {sp_ip}, błędy kabla: {sp_err}"
+            audit_rows.append(f'''<tr><td>{esc(record.get("timestamp"))}</td><td><code>{esc(record.get("trigger"))}</code></td>
+              <td style="color:{color};font-weight:bold">{esc(record.get("status"))} (HTTP {esc(record.get("http_code"))})</td>
+              <td><div><small class="green">{esc(wan_snap_summary)}</small></div><details><summary>Pełny zrzut przed restartem</summary><pre class="json-box">{snapshot}</pre></details></td></tr>''')
         if not audit_rows:
             audit_rows.append('<tr><td colspan="4" class="empty">Brak zarejestrowanych restartów.</td></tr>')
         logs = esc("\n".join(st["logs"][-35:]))
